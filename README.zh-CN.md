@@ -3,15 +3,14 @@
 > 让 ChatGPT 网页对话通过 OpenAI Secure MCP Tunnel 调度本机 Codex，
 > 同时把“代码仓库”“本机控制权”“ChatGPT 授权”明确分开。
 
-## 先回答最重要的问题
+## 安全模型与信任边界
 
-**不会因为别人打开或克隆这个 GitHub 仓库，就能直接控制你家里的电脑。**
+克隆或安装本仓库不会自动获得任何设备的执行权限。仓库仅包含源代码、
+安装脚本、Skill、测试和说明，不包含设备专属的授权材料：
 
-仓库只包含源代码、安装脚本、Skill、测试和说明，不包含以下任何一项：
-
-- 你的 Tunnel profile 或 runtime key；
-- 你的 ChatGPT Developer MCP 授权；
-- 你的 Codex 登录；
+- Tunnel profile 或 runtime key；
+- ChatGPT Developer MCP 授权；
+- Codex 登录凭据；
 - 本机能力签名密钥；
 - 本机原始 Codex thread/job ID；
 - 浏览器 Cookie、SSH key、Keychain 或生产环境变量。
@@ -26,14 +25,12 @@ flowchart LR
     D --> E[Guard 按固定策略调用本机 Codex]
 ```
 
-缺少任何一环，都不能从仓库远程控制电脑。即使仓库公开，其他人也只
-能获得安装包；他们必须在自己的设备上完成自己的 Codex 登录、Tunnel
-配置和 ChatGPT 授权。
+缺少任何一环，Bridge 都无法建立远程执行链。每台设备必须独立完成
+Codex 登录、Tunnel 配置和 ChatGPT 授权，授权材料不得随仓库分发。
 
-但要诚实说明：一旦你在自己的 Mac 上启用 `personal-full-control`，并在
-ChatGPT 对话中附加、授权这个 App，这条链路就是按设计拥有很高权限：
-`danger-full-access + approval-policy=never`。方便性来自你主动建立的本机
-授权链，而不是 GitHub 仓库本身。
+`personal-full-control` 是明确的高权限预设：设备所有者完成上述授权后，
+Guard 会以 `danger-full-access + approval-policy=never` 调用 Codex。共享或
+低信任环境应改用 `workspace-safe`，并在授权前审查工具清单与权限范围。
 
 ## 它实际怎么工作
 
