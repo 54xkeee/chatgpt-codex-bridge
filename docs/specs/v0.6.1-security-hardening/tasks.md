@@ -12,5 +12,5 @@ Spec ID: `v0.6.1-security-hardening`
 - [x] SH-T07 Keep source/package runtime copies byte-identical and bump version.
 - [x] SH-T08 Add the illustrated Chinese README and GitHub release checklist.
 - [x] SH-T09 Run focused and full verification plus anonymous export audit.
-- [ ] SH-T10 Commit, push, publish a corrected tag and verify anonymous install
+- [x] SH-T10 Commit, push, publish a corrected tag and verify anonymous install
   truth.
