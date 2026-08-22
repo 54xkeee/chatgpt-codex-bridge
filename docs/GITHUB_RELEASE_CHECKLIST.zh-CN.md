@@ -29,7 +29,10 @@
 - [ ] 权限、删除、部署、付费、外部账号动作没有夸大或模糊描述。
 - [ ] 真实运行证据已泛化，不保留个人账号、主机、网络、耗时遥测。
 - [ ] 截图裁掉账号、路径、对话 ID、App/Tunnel 名称、书签和通知。
-- [ ] 优先用 Mermaid、合成截图或占位符。
+- [ ] 产品演示图优先从实际组件/页面代码注入合成数据后重新渲染；架构关系
+      才使用 Mermaid，不能拿流程图代替用户要求的页面截图。
+- [ ] 每张合成演示截图都在页面内显式标记 `DEMO` / `SYNTHETIC DATA`，
+      README caption 同时说明来源和数据边界。
 - [ ] 历史坑写成可复用故障模式，不写成个人设备日志。
 
 ## D. 供应链和安装
@@ -61,6 +64,7 @@
 /bin/zsh tests/portable/test-macos-installer.zsh
 /bin/zsh tests/portable/test-public-sanitization.zsh
 /bin/zsh tests/portable/test-plugin-package.zsh
+/bin/zsh tests/portable/test-readme-demo.zsh
 gitleaks git --redact --no-banner
 git fsck --full --strict
 ```
