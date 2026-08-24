@@ -37,9 +37,6 @@ $env:CHATGPT_CODEX_BRIDGE_STATE_DIR = $state
 $env:CHATGPT_CODEX_BRIDGE_RUNTIME_DIR = $runtime
 $env:CHATGPT_CODEX_BRIDGE_LOG_DIR = $logs
 $env:CHATGPT_CODEX_BRIDGE_STARTUP_DIR = $startup
-$codex = (Get-Command codex.cmd -CommandType Application).Source
-$python = (Get-Command python.exe -CommandType Application | Select-Object -First 1).Source
-
 try {
     $tokens = $null
     $errors = $null
@@ -60,6 +57,8 @@ foreach ($functionName in @('Test-FullyQualifiedPath','Quote-Cmd','Invoke-Checke
     Invoke-Checked $fakeTunnel @('--version') 'Windows CLI invocation failed'
     if ($PathValidationOnly) { Write-Output 'PASS: Windows PowerShell 5.1 path validation'; return }
 
+    $codex = (Get-Command codex.cmd -CommandType Application).Source
+    $python = (Get-Command python.exe -CommandType Application | Select-Object -First 1).Source
     & $controller install -Profile windows-fixture -Workspace $workspace -CodexBin $fakeTunnel -TunnelClientBin $fakeTunnel -PythonBin $python -Preset workspace-safe -NoStart
     & $controller doctor -NoStart
     $config = [IO.File]::ReadAllText((Join-Path $state 'config.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
