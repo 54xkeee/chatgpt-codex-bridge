@@ -33,6 +33,31 @@ flowchart LR
 得到的整体内容经常比单独使用最高档 Codex 5.6 Sol 更强。这是工作流体验，
 不是受控模型评测结论。
 
+## 可持久恢复的状态卡片
+
+下面三张图由当前 Guard 小部件和合成任务数据生成，路径、Job ID 与结果均为
+演示值，不含设备或账号信息。
+
+### Codex 在本机后台执行
+
+![Codex 后台执行合成演示](docs/assets/readme/codex-job-running.jpg)
+
+### 完成并等待 ChatGPT 审查
+
+![Codex 完成合成演示](docs/assets/readme/codex-job-completed.jpg)
+
+### 中断后保留明确恢复入口
+
+![Codex 中断恢复合成演示](docs/assets/readme/codex-job-interrupted.jpg)
+
+可从当前 Guard 源码重新生成演示：
+
+```zsh
+python3 scripts/docs/render-widget-demo.py \
+  --state completed \
+  --output /tmp/codex-widget-demo.html
+```
+
 ## 先回答最重要的问题
 
 **不会因为别人打开或克隆这个 GitHub 仓库，就能直接控制你家里的电脑。**

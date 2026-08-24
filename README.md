@@ -50,6 +50,31 @@ The maintainer's subjective experience is that ChatGPT Pro often provides
 stronger planning and review than using Codex 5.6 Sol at its highest setting by
 itself. This is a workflow observation, not a controlled model benchmark.
 
+## Durable status cards
+
+These privacy-safe screenshots are rendered from the current Guard widget with
+synthetic paths, job IDs, and results. They contain no device or account data.
+
+### Codex working in the background
+
+![Synthetic Codex running card](docs/assets/readme/codex-job-running.jpg)
+
+### Completed and ready for ChatGPT review
+
+![Synthetic Codex completed card](docs/assets/readme/codex-job-completed.jpg)
+
+### Interrupted with an explicit recovery path
+
+![Synthetic Codex interrupted card](docs/assets/readme/codex-job-interrupted.jpg)
+
+Regenerate a demo from the current Guard source:
+
+```bash
+python3 scripts/docs/render-widget-demo.py \
+  --state completed \
+  --output /tmp/codex-widget-demo.html
+```
+
 ## What the Windows edition adds
 
 - Native Windows PowerShell 5.1 install, status, doctor, restart, and uninstall.
