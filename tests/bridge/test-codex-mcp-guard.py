@@ -174,6 +174,77 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
     project_name = ""
     project_roots = []
 
+    catalog_workspace = os.path.join(os.path.dirname(__file__), "workspace")
+    catalog_repository = os.path.join(catalog_workspace, "repo-alpha")
+
+    def catalog_thread(raw_thread_id):
+        cwd = (
+            os.path.join(os.path.dirname(__file__), "outside")
+            if SCENARIO == "catalog_outside_cwd"
+            else (
+                catalog_repository
+                if raw_thread_id == "thread-catalog-1"
+                and os.path.isdir(catalog_repository)
+                else catalog_workspace
+            )
+        )
+        return {
+            "id": raw_thread_id,
+            "name": (
+                "Catalog repository inspection"
+                if raw_thread_id == "thread-catalog-1"
+                else "Workspace overview"
+            ),
+            "cwd": cwd,
+            "preview": "catalog fixture " + raw_thread_id,
+            "source": "vscode",
+            "status": {"type": "idle"},
+            "createdAt": 10,
+            "updatedAt": 20 if raw_thread_id == "thread-catalog-1" else 15,
+            "gitInfo": {"branch": "main", "sha": "abc123"},
+            "canAcceptDirectInput": True,
+        }
+
+    def catalog_turns():
+        return [
+            {
+                "id": "turn-catalog-1",
+                "status": "completed",
+                "startedAt": 11,
+                "completedAt": 12,
+                "durationMs": 1,
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "inspect repository"}],
+                    },
+                    {"type": "reasoning", "text": "private reasoning"},
+                    {
+                        "type": "commandExecution",
+                        "command": ["git", "status", "--short"],
+                        "cwd": catalog_repository,
+                        "status": "completed",
+                        "exitCode": 0,
+                        "durationMs": 3,
+                        "aggregatedOutput": " M fixture.py\n",
+                    },
+                    {
+                        "type": "agentMessage",
+                        "text": "repository inspected",
+                        "phase": "final_answer",
+                    },
+                ],
+            },
+            {
+                "id": "turn-catalog-2",
+                "status": "completed",
+                "startedAt": 13,
+                "completedAt": 14,
+                "durationMs": 1,
+                "items": [{"type": "plan", "text": "follow-up plan"}],
+            },
+        ]
+
     def save_app_server_state():
         with open(STATE_PATH, "w", encoding="utf-8") as state_file:
             json.dump({
@@ -226,7 +297,9 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
         elif method in ("thread/start", "thread/resume"):
             requested_cwd = params.get("cwd", "")
             thread_id = params.get("threadId") or "thread-async-1"
-            requested_project_id = params.get("projectId") or "project-async-1"
+            requested_project_id = params.get("projectId") or (
+                "" if SCENARIO == "async_project_api_missing" else "project-async-1"
+            )
             project_id = requested_project_id
             response_cwd = requested_cwd
             if SCENARIO == "async_wrong_cwd":
@@ -268,18 +341,66 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
                 },
             })
         elif method == "thread/list":
+            if isinstance(params.get("cwd"), list):
+                roots = params["cwd"]
+                candidates = [
+                    catalog_thread("thread-catalog-1"),
+                    catalog_thread("thread-catalog-2"),
+                ]
+                if SCENARIO != "catalog_outside_cwd":
+                    candidates = [item for item in candidates if item["cwd"] in roots]
+                search_term = params.get("searchTerm")
+                if search_term:
+                    lowered = search_term.casefold()
+                    candidates = [
+                        item for item in candidates
+                        if lowered in (item["name"] + " " + item["preview"]).casefold()
+                    ]
+                offset = 1 if params.get("cursor") == "thread-page-2" else 0
+                limit = params.get("limit", len(candidates))
+                page = candidates[offset:offset + limit]
+                next_cursor = (
+                    "thread-page-2"
+                    if offset == 0 and offset + len(page) < len(candidates)
+                    else None
+                )
+                emit({
+                    "id": message["id"],
+                    "result": {"data": page, "nextCursor": next_cursor},
+                })
+            else:
+                emit({
+                    "id": message["id"],
+                    "result": {
+                        "data": [{
+                            "id": thread_id,
+                            "cwd": requested_cwd,
+                            "projectId": project_id,
+                            "source": "vscode",
+                            "status": {"type": "idle"},
+                        }],
+                        "nextCursor": None,
+                    },
+                })
+        elif method == "thread/read":
+            raw_thread_id = params.get("threadId", "thread-catalog-1")
+            thread = catalog_thread(raw_thread_id)
+            if params.get("includeTurns"):
+                thread["turns"] = catalog_turns()
+            emit({"id": message["id"], "result": {"thread": thread}})
+        elif method == "thread/turns/list":
+            turns = catalog_turns()
+            offset = 1 if params.get("cursor") == "turn-page-2" else 0
+            limit = params.get("limit", len(turns))
+            page = turns[offset:offset + limit]
+            next_cursor = (
+                "turn-page-2"
+                if offset == 0 and offset + len(page) < len(turns)
+                else None
+            )
             emit({
                 "id": message["id"],
-                "result": {
-                    "data": [{
-                        "id": thread_id,
-                        "cwd": requested_cwd,
-                        "projectId": project_id,
-                        "source": "vscode",
-                        "status": {"type": "idle"},
-                    }],
-                    "nextCursor": None,
-                },
+                "result": {"data": page, "nextCursor": next_cursor},
             })
         elif method == "thread/name/set":
             emit({"id": message["id"], "result": {}})
@@ -379,6 +500,33 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
             if SCENARIO == "async_slow":
                 import time
                 time.sleep(0.35)
+            if SCENARIO == "async_report":
+                for item in (
+                    {
+                        "type": "commandExecution",
+                        "id": "command-async-1",
+                        "command": ["python", "-m", "unittest"],
+                        "cwd": requested_cwd,
+                        "status": "completed",
+                        "exitCode": 0,
+                        "durationMs": 4,
+                        "aggregatedOutput": "OK\n",
+                    },
+                    {
+                        "type": "fileChange",
+                        "id": "file-async-1",
+                        "changes": [{"path": "src/catalog.py", "kind": "update"}],
+                        "status": "completed",
+                    },
+                ):
+                    emit({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": "turn-async-1",
+                            "item": item,
+                        },
+                    })
             status = "failed" if SCENARIO == "async_fail" else "completed"
             content = "async ok: " + prompt
             emit({
@@ -849,58 +997,80 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             [
                 "codex",
                 "codex-reply",
+                "codex-run",
                 "codex-start",
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
                 "codex-job-status",
+                "codex-overview",
+                "codex-project-list",
+                "codex-repository-list",
+                "codex-thread-list",
+                "codex-thread-read",
+                "codex-job-list",
             ],
         )
-        for tool in tools[:4]:
+        for tool in tools[:5]:
             self.assertEqual(tool["annotations"], SAFETY_ANNOTATIONS)
-        for tool in tools[4:]:
+        for tool in tools[5:]:
             self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
-        self.assertEqual(tools[4]["_meta"]["ui"]["visibility"], ["model"])
-        self.assertNotIn("resourceUri", tools[4]["_meta"]["ui"])
-        self.assertEqual(tools[5]["annotations"]["readOnlyHint"], True)
-        self.assertEqual(tools[5]["_meta"]["ui"]["visibility"], ["model", "app"])
+        self.assertEqual(tools[5]["_meta"]["ui"]["visibility"], ["model"])
+        self.assertNotIn("resourceUri", tools[5]["_meta"]["ui"])
+        self.assertEqual(tools[6]["annotations"]["readOnlyHint"], True)
+        self.assertEqual(tools[6]["_meta"]["ui"]["visibility"], ["model", "app"])
         self.assertEqual(
-            tools[5]["_meta"]["ui"]["resourceUri"],
+            tools[6]["_meta"]["ui"]["resourceUri"],
             "ui://chatgpt-codex-bridge/job-status-v4.html",
         )
-        self.assertEqual(tools[6]["_meta"]["ui"]["visibility"], ["app"])
-        self.assertNotIn("resourceUri", tools[6]["_meta"]["ui"])
-        self.assertNotIn("openai/outputTemplate", tools[6]["_meta"])
+        self.assertEqual(tools[7]["_meta"]["ui"]["visibility"], ["app"])
+        self.assertNotIn("resourceUri", tools[7]["_meta"]["ui"])
+        self.assertNotIn("openai/outputTemplate", tools[7]["_meta"])
         self.assertEqual(
             tools[2]["_meta"]["openai/outputTemplate"],
             "ui://chatgpt-codex-bridge/job-status-v4.html",
         )
-        start_schema = tools[2]["inputSchema"]
+        self.assertEqual(
+            tools[3]["_meta"]["openai/outputTemplate"],
+            "ui://chatgpt-codex-bridge/job-status-v4.html",
+        )
+        run_schema = tools[2]["inputSchema"]
+        self.assertEqual(run_schema["required"], ["prompt"])
+        self.assertEqual(set(run_schema["properties"]), {"prompt"})
+        start_schema = tools[3]["inputSchema"]
         self.assertEqual(start_schema["required"], ["prompt"])
         self.assertEqual(
             set(start_schema["properties"]),
             {"prompt", "projectName"},
         )
         self.assertNotIn("cwd", json.dumps(start_schema))
-        self.assertIn("workspace-new-project", tools[2]["description"])
-        self.assertIn("new project", tools[2]["description"].lower())
+        self.assertIn("existing workspace", tools[2]["description"])
         self.assertIn("MUST call codex-wait", tools[2]["description"])
+        self.assertIn("workspace-new-project", tools[3]["description"])
+        self.assertIn("new project", tools[3]["description"].lower())
         self.assertIn("MUST call codex-wait", tools[3]["description"])
-        self.assertIn("MUST call this tool again", tools[4]["description"])
-        self.assertIn("same threadId", tools[4]["description"])
-        self.assertEqual(tools[4]["inputSchema"]["required"], ["jobId"])
+        self.assertIn("MUST call codex-wait", tools[4]["description"])
+        self.assertIn("MUST call this tool again", tools[5]["description"])
+        self.assertIn("same threadId", tools[5]["description"])
+        self.assertEqual(tools[5]["inputSchema"]["required"], ["jobId"])
         self.assertEqual(
-            set(tools[4]["inputSchema"]["properties"]),
+            set(tools[5]["inputSchema"]["properties"]),
             {"jobId"},
         )
         expected_statuses = [
             "queued", "running", "completed", "failed", "interrupted"
         ]
-        for tool in tools[2:]:
+        for tool in tools[2:8]:
             self.assertEqual(
                 tool["outputSchema"]["properties"]["status"]["enum"],
                 expected_statuses,
             )
+        catalog_tools = tools[8:]
+        self.assertEqual(len(catalog_tools), 6)
+        for tool in catalog_tools:
+            self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
+            self.assertFalse(tool["inputSchema"]["additionalProperties"])
+            self.assertFalse(tool["outputSchema"]["additionalProperties"])
 
         codex_schema = tools[0]["inputSchema"]
         self.assertEqual(codex_schema["type"], "object")
@@ -939,6 +1109,149 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             "base-instructions",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_catalog_tools_cover_projects_repositories_threads_history_and_jobs(self):
+        harness = self.harness()
+        repo_alpha = harness.workspace / "repo-alpha"
+        repo_beta = harness.workspace / "repo-beta"
+        plain = harness.workspace / "plain"
+        nested_repo = plain / "nested-repo"
+        for path in (repo_alpha, repo_beta, nested_repo):
+            path.mkdir(parents=True)
+            (path / ".git").mkdir()
+        harness.initialize()
+        job_id, _job_dir, _status_path = harness.write_job_fixture(
+            "00000000-0000-4000-8000-000000000010",
+            "completed",
+            content="catalog job complete",
+            phase="completed",
+            activity="Catalog job completed.",
+            lastEventAt=time.time(),
+            failureStage="",
+            nextAction="review",
+            report={
+                "outcome": "completed",
+                "summary": "catalog job complete",
+                "changedFiles": [],
+                "commands": [],
+                "checks": [],
+                "blockers": [],
+                "questions": [],
+                "nextStep": "review",
+            },
+        )
+
+        overview = harness.call(3, "codex-overview", {})
+        overview_result = overview["result"]["structuredContent"]
+        self.assertEqual(overview_result["workspace"], str(harness.workspace))
+        self.assertEqual(overview_result["counts"], {
+            "projects": 3,
+            "repositories": 2,
+            "threads": 2,
+            "jobs": 1,
+            "activeJobs": 0,
+        })
+        self.assertEqual(overview_result["degraded"], [])
+        self.assertIn("historical data", overview["result"]["content"][0]["text"])
+
+        projects = harness.call(4, "codex-project-list", {"limit": 1})
+        project_page = projects["result"]["structuredContent"]
+        self.assertEqual(project_page["projects"][0]["path"], str(harness.workspace))
+        project_cursor = project_page["nextCursor"]
+        self.assertTrue(project_cursor.startswith("cgb2.projects-cursor."))
+        project_id = project_page["projects"][0]["projectId"]
+        self.assertTrue(project_id.startswith("cgb2.project."))
+        next_projects = harness.call(5, "codex-project-list", {
+            "limit": 1,
+            "cursor": project_cursor,
+        })
+        self.assertNotEqual(
+            next_projects["result"]["structuredContent"]["projects"][0]["path"],
+            str(harness.workspace),
+        )
+
+        repositories = harness.call(6, "codex-repository-list", {"limit": 10})
+        repository_page = repositories["result"]["structuredContent"]
+        self.assertEqual(
+            {entry["path"] for entry in repository_page["repositories"]},
+            {str(repo_alpha), str(repo_beta)},
+        )
+        self.assertNotIn(str(nested_repo), json.dumps(repository_page))
+        for repository in repository_page["repositories"]:
+            self.assertTrue(repository["repositoryId"].startswith("cgb2.repository."))
+            self.assertTrue(repository["projectId"].startswith("cgb2.project."))
+
+        threads = harness.call(7, "codex-thread-list", {"limit": 1})
+        thread_page = threads["result"]["structuredContent"]
+        self.assertEqual(len(thread_page["threads"]), 1)
+        thread = thread_page["threads"][0]
+        self.assertEqual(thread["cwd"], str(repo_alpha))
+        self.assertTrue(thread["threadId"].startswith("cgb2.thread."))
+        self.assertTrue(thread["projectId"].startswith("cgb2.project."))
+        self.assertTrue(thread_page["nextCursor"].startswith("cgb2.threads-cursor."))
+        filtered = harness.call(8, "codex-thread-list", {
+            "projectId": thread["projectId"],
+            "query": "repository",
+            "limit": 10,
+        })
+        self.assertEqual(
+            [entry["threadId"] for entry in filtered["result"]["structuredContent"]["threads"]],
+            [thread["threadId"]],
+        )
+
+        history = harness.call(9, "codex-thread-read", {
+            "threadId": thread["threadId"],
+            "limit": 1,
+        })
+        history_page = history["result"]["structuredContent"]
+        self.assertEqual(history_page["thread"]["threadId"], thread["threadId"])
+        self.assertEqual(len(history_page["turns"]), 1)
+        serialized_history = json.dumps(history_page, ensure_ascii=False)
+        self.assertIn("git status --short", serialized_history)
+        self.assertIn("repository inspected", serialized_history)
+        self.assertNotIn("private reasoning", serialized_history)
+        items_cursor = history_page["nextCursor"]
+        self.assertTrue(items_cursor.startswith("cgb2.items-cursor."))
+        second_history_page = harness.call(10, "codex-thread-read", {
+            "threadId": thread["threadId"],
+            "limit": 1,
+            "cursor": items_cursor,
+        })["result"]["structuredContent"]
+        self.assertIn("follow-up plan", json.dumps(second_history_page))
+        self.assertIsNone(second_history_page["nextCursor"])
+
+        jobs = harness.call(11, "codex-job-list", {
+            "status": "completed",
+            "limit": 10,
+        })["result"]["structuredContent"]
+        self.assertEqual([entry["jobId"] for entry in jobs["jobs"]], [job_id])
+        self.assertEqual(jobs["jobs"][0]["report"]["outcome"], "completed")
+
+        wrong_cursor = harness.call(12, "codex-repository-list", {
+            "limit": 1,
+            "cursor": project_cursor,
+        })
+        self.assertEqual(wrong_cursor["error"]["code"], -32602)
+        wrong_project = harness.call(13, "codex-thread-list", {
+            "projectId": repository_page["repositories"][0]["repositoryId"],
+        })
+        self.assertEqual(wrong_project["error"]["code"], -32602)
+        wrong_thread_cursor = harness.call(14, "codex-thread-read", {
+            "threadId": harness.capability("thread", "thread-catalog-2"),
+            "cursor": items_cursor,
+        })
+        self.assertEqual(wrong_thread_cursor["error"]["code"], -32602)
+
+    def test_catalog_rejects_thread_cwd_outside_the_configured_workspace(self):
+        harness = self.harness(scenario="catalog_outside_cwd")
+        harness.initialize()
+
+        listed = harness.call(3, "codex-thread-list", {})
+        self.assertEqual(listed["error"]["code"], -32602)
+        read = harness.call(4, "codex-thread-read", {
+            "threadId": harness.capability("thread", "thread-catalog-1"),
+        })
+        self.assertEqual(read["error"]["code"], -32602)
 
     def test_initialize_is_replayed_for_tunnel_multiplexing(self):
         harness = self.harness()
@@ -996,11 +1309,18 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             [
                 "codex",
                 "codex-reply",
+                "codex-run",
                 "codex-start",
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
                 "codex-job-status",
+                "codex-overview",
+                "codex-project-list",
+                "codex-repository-list",
+                "codex-thread-list",
+                "codex-thread-read",
+                "codex-job-list",
             ],
         )
 
@@ -1179,11 +1499,18 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             [
                 "codex",
                 "codex-reply",
+                "codex-run",
                 "codex-start",
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
                 "codex-job-status",
+                "codex-overview",
+                "codex-project-list",
+                "codex-repository-list",
+                "codex-thread-list",
+                "codex-thread-read",
+                "codex-job-list",
             ],
         )
 
@@ -1292,6 +1619,110 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 return last
             time.sleep(0.05)
         raise AssertionError("job did not reach terminal state: " + repr(last))
+
+    def test_codex_run_uses_existing_workspace_without_project_bootstrap(self):
+        harness = self.harness()
+        harness.initialize()
+
+        queued = harness.call(3, "codex-run", {"prompt": "inspect existing repo"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        final = self.wait_for_job(harness, job_id)["result"]["structuredContent"]
+
+        self.assertEqual(final["status"], "completed")
+        self.assertIn("inspect existing repo", final["content"])
+        request = json.loads(
+            (harness.job_dir_for(job_id) / "request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(request["workspace"], str(harness.workspace))
+        self.assertFalse(request["bootstrapRequired"])
+        self.assertTrue(request["existingWorkspace"])
+        child_requests = harness.read_child_state()["requests"]
+        methods = [message.get("method") for message in child_requests]
+        self.assertNotIn("project/create", methods)
+        self.assertNotIn("project/list", methods)
+        thread_start = next(
+            message for message in child_requests
+            if message.get("method") == "thread/start"
+        )
+        self.assertEqual(thread_start["params"]["cwd"], str(harness.workspace))
+        self.assertNotIn("projectId", thread_start["params"])
+
+        continued = harness.call(4, "codex-reply-async", {
+            "prompt": "continue existing repo inspection",
+            "threadId": final["threadId"],
+        })
+        self.assertIn("result", continued, continued)
+        continued_job_id = continued["result"]["structuredContent"]["jobId"]
+        continued_final = self.wait_for_job(
+            harness, continued_job_id
+        )["result"]["structuredContent"]
+        self.assertEqual(continued_final["status"], "completed")
+        self.assertEqual(continued_final["threadId"], final["threadId"])
+
+    def test_async_jobs_expose_progress_report_and_task_return_contract(self):
+        harness = self.harness(scenario="async_report")
+        harness.initialize()
+
+        queued = harness.call(3, "codex-run", {"prompt": "produce a report"})
+        queued_state = queued["result"]["structuredContent"]
+        for field in (
+            "phase",
+            "activity",
+            "lastEventAt",
+            "failureStage",
+            "nextAction",
+            "report",
+        ):
+            self.assertIn(field, queued_state)
+        self.assertEqual(queued_state["phase"], "queued")
+        self.assertEqual(queued_state["nextAction"], "wait")
+        self.assertEqual(queued_state["report"]["outcome"], "running")
+
+        final = self.wait_for_job(
+            harness, queued_state["jobId"]
+        )["result"]["structuredContent"]
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["phase"], "completed")
+        self.assertEqual(final["failureStage"], "")
+        self.assertEqual(final["nextAction"], "review")
+        self.assertGreater(final["lastEventAt"], 0)
+        report = final["report"]
+        self.assertEqual(report["outcome"], "completed")
+        self.assertEqual(report["changedFiles"], ["src/catalog.py"])
+        self.assertEqual(report["commands"][0]["command"], "python -m unittest")
+        self.assertEqual(report["checks"], report["commands"])
+        self.assertEqual(report["blockers"], [])
+        self.assertEqual(report["questions"], [])
+        self.assertEqual(report["nextStep"], "review")
+
+        child_prompt = harness.read_child_state()["prompt"]
+        self.assertIn("produce a report", child_prompt)
+        self.assertIn("[BRIDGE TASK RETURN CONTRACT]", child_prompt)
+        for heading in (
+            "Outcome",
+            "Summary",
+            "Files changed",
+            "Commands and checks",
+            "Blockers or questions",
+            "Next step",
+        ):
+            self.assertIn(heading, child_prompt)
+
+        failed_harness = self.harness(scenario="async_fail")
+        failed_harness.initialize()
+        failed_job = failed_harness.call(
+            3, "codex-run", {"prompt": "fail with structured status"}
+        )["result"]["structuredContent"]["jobId"]
+        failed = self.wait_for_job(
+            failed_harness, failed_job
+        )["result"]["structuredContent"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["phase"], "failed")
+        self.assertTrue(failed["failureStage"])
+        self.assertEqual(failed["nextAction"], "repair")
+        self.assertEqual(failed["report"]["outcome"], "failed")
+        self.assertTrue(failed["report"]["blockers"])
+        self.assertEqual(failed["report"]["nextStep"], "repair")
 
     def test_public_identifiers_are_scoped_signed_capabilities(self):
         harness = self.harness()
@@ -1800,6 +2231,43 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         )
         self.assertNotIn(str(project_root), json.dumps(completed, ensure_ascii=False))
 
+    def test_async_start_uses_cwd_fallback_when_project_api_is_missing(self):
+        harness = self.harness(scenario="async_project_api_missing")
+        harness.initialize()
+
+        queued = harness.call(3, "codex-start", {
+            "prompt": "build with cwd compatibility",
+            "projectName": "cwd fallback",
+        })
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        final = self.wait_for_job(harness, job_id)["result"]["structuredContent"]
+        self.assertEqual(final["status"], "completed")
+
+        child_state = harness.read_child_state()
+        methods = [request.get("method") for request in child_state["requests"]]
+        self.assertIn("project/create", methods)
+        self.assertNotIn("project/list", methods)
+        thread_start = next(
+            request for request in child_state["requests"]
+            if request.get("method") == "thread/start"
+        )
+        project_root = next(harness.workspace.iterdir())
+        self.assertEqual(thread_start["params"]["cwd"], str(project_root))
+        self.assertNotIn("projectId", thread_start["params"])
+        thread_list = next(
+            request for request in child_state["requests"]
+            if request.get("method") == "thread/list"
+        )
+        self.assertEqual(
+            thread_list["params"],
+            {"cwd": str(project_root), "limit": 100},
+        )
+        durable = json.loads(
+            (harness.job_dir_for(job_id) / "status.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(durable["projectApi"])
+        self.assertEqual(durable["projectId"], "")
+
     def test_project_names_are_safe_unique_and_backward_compatible(self):
         harness = self.harness()
         harness.initialize()
@@ -1958,7 +2426,6 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             "async_non_sidebar",
             "async_wrong_cwd",
             "async_project_mismatch",
-            "async_project_api_missing",
         ):
             with self.subTest(scenario=scenario):
                 harness = self.harness(scenario=scenario)
@@ -2080,6 +2547,8 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertEqual([tool["name"] for tool in tools], ["codex", "codex-reply"])
         rejected = harness.call(3, "codex-start", {"prompt": "must not run"})
         self.assertEqual(rejected["error"]["code"], -32601)
+        catalog_rejected = harness.call(4, "codex-overview", {})
+        self.assertEqual(catalog_rejected["error"]["code"], -32601)
 
     def test_dead_running_job_is_reported_interrupted_and_state_is_private(self):
         harness = self.harness()

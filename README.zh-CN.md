@@ -1,7 +1,37 @@
-# ChatGPT Codex Bridge 中文说明
+# ChatGPT Codex Bridge for Windows
 
-> 让 ChatGPT 网页对话通过 OpenAI Secure MCP Tunnel 调度本机 Codex，
-> 同时把“代码仓库”“本机控制权”“ChatGPT 授权”明确分开。
+> **ChatGPT Pro in the loop：ChatGPT Pro 做主管，Codex 做执行者。**
+> ChatGPT 负责理解目标、查阅仓库与历史对话、分派和审查；Codex 负责在
+> Windows 本机真正编辑代码、运行命令和测试。
+
+[English](README.md) · [Windows 实测证明](docs/WINDOWS_LIVE_PROOF.md) ·
+[原始项目](https://github.com/larryppgg/chatgpt-codex-bridge)
+
+这是 [`larryppgg/chatgpt-codex-bridge`](https://github.com/larryppgg/chatgpt-codex-bridge)
+的 Windows 移植与增强版。项目保留原始 MIT 历史和架构，并加入原生
+PowerShell 5.1 控制器、Windows 进程树治理、全局 Codex 目录、结构化进度
+报告，以及已经真实跑通的 ChatGPT → Secure MCP Tunnel → Windows Codex
+→ ChatGPT 链路。
+
+## ChatGPT Pro 做主管，为什么有用？
+
+Codex 擅长进入仓库执行；ChatGPT Pro 更适合站在任务上层，持续保留目标、
+找到正确仓库和已有 Codex 对话、审查进度，并决定继续、纠偏、测试还是结束。
+
+```mermaid
+flowchart LR
+    U["用户"] --> G["ChatGPT Pro：主管"]
+    G --> T["OpenAI Secure MCP Tunnel"]
+    T --> B["Codex MCP Guard"]
+    B --> C["本机 Codex：执行者"]
+    C --> R["仓库、命令与测试"]
+    B --> G
+    G --> U
+```
+
+维护者的个人体感是：在复杂 coding 任务中，ChatGPT Pro 负责规划和审查，
+得到的整体内容经常比单独使用最高档 Codex 5.6 Sol 更强。这是工作流体验，
+不是受控模型评测结论。
 
 ## 先回答最重要的问题
 
@@ -16,7 +46,7 @@
 - 本机原始 Codex thread/job ID；
 - 浏览器 Cookie、SSH key、Keychain 或生产环境变量。
 
-必须同时满足下面四个条件，ChatGPT 才能向这台 Mac 发起调用：
+必须同时满足下面四个条件，ChatGPT 才能向这台设备发起调用：
 
 ```mermaid
 flowchart LR
@@ -30,7 +60,8 @@ flowchart LR
 能获得安装包；他们必须在自己的设备上完成自己的 Codex 登录、Tunnel
 配置和 ChatGPT 授权。
 
-但要诚实说明：一旦你在自己的 Mac 上启用 `personal-full-control`，并在
+但要诚实说明：一旦你在自己的 macOS 或 Windows 设备上启用
+`personal-full-control`，并在
 ChatGPT 对话中附加、授权这个 App，这条链路就是按设计拥有很高权限：
 `danger-full-access + approval-policy=never`。方便性来自你主动建立的本机
 授权链，而不是 GitHub 仓库本身。
@@ -77,7 +108,7 @@ sequenceDiagram
 
 | 预设 | Sandbox | Approval | 用途 |
 |---|---|---|---|
-| `personal-full-control` | `danger-full-access` | `never` | 个人可信 Mac，优先方便 |
+| `personal-full-control` | `danger-full-access` | `never` | 个人可信 Windows / Mac，优先效率 |
 | `workspace-safe` | `workspace-write` | `on-request` | 共享或低信任工作区 |
 
 MCP 调用方不能临时把 safe 预设改成 full control，也不能自行指定任意
@@ -114,31 +145,52 @@ flowchart TD
 
 ### 1. 前置条件
 
-- macOS；
+- macOS 或 Windows 10/11；
 - 已登录且可运行的 Codex；
 - Python 3；
 - OpenAI 官方 `tunnel-client`；
 - 本设备自己的 Tunnel profile；
 - 已存在的 workspace 容器目录。
 
-### 2. 安装固定版本
+### 2. 安装 Windows 发行版
 
-```zsh
-codex plugin marketplace add larryppgg/chatgpt-codex-bridge \
-  --ref chatgpt-codex-bridge-v0.6.1
+```powershell
+codex plugin marketplace add 54xkeee/chatgpt-codex-bridge `
+  --ref windows-v0.6.1
 codex plugin add chatgpt-codex-bridge@chatgpt-codex-bridge
 ```
 
 插件安装完成后新开一个 Codex 任务，让 Skill 清单重新加载。进入插件根
 目录后执行：
 
+```powershell
+& scripts\install-windows.ps1 `
+  -Profile <本设备的-profile> `
+  -Workspace <绝对-workspace-目录> `
+  -Preset personal-full-control
+
+& scripts\doctor-windows.ps1
+```
+
+从源码直接安装：
+
+```powershell
+git clone https://github.com/54xkeee/chatgpt-codex-bridge.git
+cd chatgpt-codex-bridge\plugins\chatgpt-codex-bridge
+& scripts\install-windows.ps1 `
+  -Profile chatgpt-codex `
+  -Workspace D:\Work `
+  -Preset personal-full-control
+& scripts\doctor-windows.ps1
+```
+
+macOS 仍保留原项目脚本：
+
 ```zsh
 /bin/zsh scripts/install-macos.zsh \
   --profile <本设备的-profile> \
   --workspace <绝对-workspace-目录> \
   --preset personal-full-control
-
-/bin/zsh scripts/doctor.zsh
 ```
 
 不要把别人的 Tunnel profile、凭据文件、Codex 登录或会话目录复制到新
@@ -165,8 +217,67 @@ codex plugin add chatgpt-codex-bridge@chatgpt-codex-bridge
 /bin/zsh scripts/uninstall-macos.zsh
 ```
 
+Windows 日常操作：
+
+```powershell
+& scripts\chatgpt-codex-bridge-windows.ps1 status
+& scripts\chatgpt-codex-bridge-windows.ps1 doctor
+& scripts\chatgpt-codex-bridge-windows.ps1 restart
+& scripts\chatgpt-codex-bridge-windows.ps1 stop
+& scripts\uninstall-windows.ps1
+```
+
+## 全局目录：让 ChatGPT 先了解 Codex
+
+在 `personal-full-control` 预设下，Bridge 不只负责启动任务，也提供六个只读
+目录工具：
+
+| 工具 | 用途 |
+|---|---|
+| `codex-overview` | 一次查看工作区、运行时指纹、项目/仓库/对话/Job 数量与最近条目 |
+| `codex-project-list` | 分页列出工作区内的 Codex 项目 |
+| `codex-repository-list` | 分页列出 Git 仓库、分支、改动状态与近期对话数 |
+| `codex-thread-list` | 按项目或关键词查找最近 Codex 对话 |
+| `codex-thread-read` | 分页读取一条对话的摘要历史、命令、文件变更与工具调用 |
+| `codex-job-list` | 按状态查看 Bridge 的持久化 Job |
+
+目录边界固定为安装时配置的 workspace 根目录及其**一级子目录**；它不会
+递归扫描整块磁盘，也不会跟随符号链接扩展范围。分页 cursor、`projectId`、
+`repositoryId` 和 `threadId` 都是当前安装实例签名的 capability。由
+`codex-thread-list` 返回的 `threadId` 可以直接交给
+`codex-reply-async`，让 ChatGPT 继续同一条 Codex 对话。
+
+推荐的控制顺序是：
+
+1. `codex-overview` 获取设备和目录概况；
+2. 用项目、仓库和对话列表定位上下文；
+3. 必要时用 `codex-thread-read` 查阅最近历史；
+4. 继续已有对话时调用 `codex-reply-async`，新工作才调用 `codex-run` 或
+   `codex-start`；
+5. 通过 `codex-wait` 查看过程并审查终态。
+
+`codex-thread-read` 优先使用 Codex App Server 的 `thread/turns/list` 接口，
+只返回有界的摘要视图；历史消息属于待分析的数据，不应被当成新的控制指令。
+
+### 进度与结果
+
+异步 Job 的公开状态除 `queued/running/completed/failed/interrupted` 外，还包含：
+
+- `phase`：当前阶段；
+- `activity`：最近活动；
+- `lastEventAt`：最近事件时间；
+- `failureStage`：发生故障的阶段；
+- `nextAction`：`wait`、`review`、`continue`、`repair` 或 `none`；
+- `report`：结构化结果，包含 `outcome`、`summary`、`changedFiles`、
+  `commands`、`checks`、`blockers`、`questions` 和 `nextStep`。
+
+`codex-overview.runtime.guardSha256` 是当前实际运行 Guard 文件的 SHA-256，
+Windows 安装或升级后可用它确认 ChatGPT 命中的运行时与本机文件一致，而
+不是旧进程或旧缓存。
+
 长任务应使用：
 
+- 现有工作区或已有仓库：`codex-run` → 重复 `codex-wait`；
 - 新项目：`codex-start` → 重复 `codex-wait`；
 - 同项目继续：`codex-reply-async` → 重复 `codex-wait`；
 - 旧卡片恢复：`codex-job-open`，不要重复 `codex-start`；
@@ -261,9 +372,45 @@ v0.6.0 已退出分发，不作为回滚版本；需要取证时只使用私有�
 门禁只报告文件和行号，不打印 denylist 内容。完整发布标准见
 [GitHub 发布脱敏清单](docs/GITHUB_RELEASE_CHECKLIST.zh-CN.md)。
 
+## Windows 已跑通证明
+
+2026-08-24 的真实验收完成了以下链路：
+
+```text
+ChatGPT Pro
+→ Secure MCP Tunnel
+→ Windows Codex MCP Guard
+→ 本机 Codex
+→ 仓库命令与结构化报告
+→ ChatGPT 审查
+```
+
+- ChatGPT 新连接成功加载 14 个 MCP 操作；
+- 全局目录识别目标 Git 仓库和 11 条近期 Codex 对话；
+- `codex-thread-read` 返回 3 个有界历史回合和签名分页游标；
+- `codex-run` 执行 2 条只读命令；
+- Job 依次进入 `executing`、`finalizing`、`completed`；
+- 终态报告包含 `outcome`、`summary`、`commands` 和 `nextStep`；
+- 55 项 Guard 契约测试、PowerShell 5.1 Windows 套件、EOF 清理、进程树
+  撤销、原子状态替换和插件打包检查均通过；
+- 源码 Guard、插件 Guard、本机 runtime Guard 的 SHA-256 完全一致。
+
+完整环境、命令和结果见 [Windows 实测证明](docs/WINDOWS_LIVE_PROOF.md)。
+
+## 原项目与共创者
+
+- **原始项目、总体架构与 macOS 实现：**
+  [@larryppgg](https://github.com/larryppgg)；
+- **Windows 移植、全局 Codex 目录、进度契约与现场验收：**
+  [@54xkeee](https://github.com/54xkeee)，通过 ChatGPT Pro 主管、Codex
+  执行的 in-the-loop 工作流共同完成。
+
+Git 提交历史和 MIT 版权声明保持原样。贡献边界详见
+[CONTRIBUTORS.md](CONTRIBUTORS.md)。
+
 ## 平台和产品边界
 
-- 当前服务封装只支持 macOS LaunchAgent；Windows/Linux 暂未实现。
+- 当前服务封装支持 macOS LaunchAgent 和 Windows 当前用户启动服务；Linux 暂未实现。
 - 这是 MIT 社区项目，不是 OpenAI 官方产品。
 - 不提供 ChatGPT、Codex、Tunnel、GitHub 或设备凭据。
 - 不承诺任何账号套餐一定开放 Developer MCP；以当前产品 UI 和真实工具

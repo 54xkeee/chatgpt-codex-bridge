@@ -10,11 +10,15 @@ Initialize the final project directory before implementation.
 ## Bridge mode
 
 The ChatGPT Codex Bridge has already created and selected the final project
-root. Run the bundled script from this Skill directory in current-directory
-mode:
+root. Run the platform bootstrap from this Skill directory in current-directory
+mode.
 
 ```zsh
 /bin/zsh scripts/create_workspace_project.sh --here
+```
+
+```powershell
+& scripts/create_workspace_project.ps1 -Here
 ```
 
 Do not create a nested child directory. After initialization, write or update
@@ -23,7 +27,8 @@ production code. Keep all subsequent command workdirs at the final project root.
 
 ## Direct mode
 
-Outside the bridge, use `--base-dir <absolute-parent> <project-name>`. If the
+Outside the bridge, use `--base-dir <absolute-parent> <project-name>` on macOS
+or `-BaseDir <absolute-parent> -Name <project-name>` on Windows. If the
 current directory already has strong project markers such as `.git`,
 `AGENTS.md`, `docs/specs`, or a manifest, remain in existing-project flow.
 

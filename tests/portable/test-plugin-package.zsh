@@ -54,7 +54,7 @@ assert data["name"] == "chatgpt-codex-bridge"
 assert re.fullmatch(r"0\.6\.1\+codex\.[0-9]{14}", data["version"])
 assert data["skills"] == "./skills/"
 assert data["interface"]["displayName"] == "ChatGPT Codex Bridge"
-assert data["repository"] == "https://github.com/larryppgg/chatgpt-codex-bridge"
+assert data["repository"] == "https://github.com/54xkeee/chatgpt-codex-bridge"
 assert data["license"] == "MIT"
 print("ok")
 PY
