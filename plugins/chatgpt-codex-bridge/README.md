@@ -67,6 +67,9 @@ plugin install alone does not create or authorize that ChatGPT app.
 - Continue: `codex-reply-async` on the returned `threadId` → repeated wait.
 - Closed page/model turn: reopen the conversation and use the card's explicit
   return control; use `codex-job-open` for a stale template.
+- Cancel queued or running work: `codex-job-cancel(jobId)`. It stops only the
+  verified Bridge-owned worker tree, then exposes `interrupted`; stopping the
+  App Server tree releases the Codex GUI thread/session lock.
 - Short diagnostics only: `codex` / `codex-reply`.
 
 The bundled portable `workspace-new-project` Skill initializes spec/ADR/source

@@ -94,6 +94,10 @@ does not grant access to another person's computer. Treat setup as per device.
   app and call `codex-job-open(jobId)`. It renders the same durable job without
   starting another Codex run; retrying the old card does not update its cached
   template snapshot.
+- When the user asks to stop an active durable job, call
+  `codex-job-cancel(jobId)`. It stops the verified owned execution tree before
+  returning `interrupted`, which releases the thread/session lock for Codex GUI
+  or a later same-thread continuation. Repeating it on a terminal job is a no-op.
 - Preserve `Codex thread: <threadId>` from the completion message.
 - Call `codex-reply-async(prompt, threadId)` for every correction or next
   instruction, and join every returned job with `codex-wait`. Use `codex` and

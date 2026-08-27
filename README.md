@@ -104,6 +104,7 @@ python3 scripts/docs/render-widget-demo.py \
 | `codex-reply-async` | Durable continuation of the same signed Codex thread |
 | `codex-wait` | Bounded wait until a job reaches a terminal state |
 | `codex-job-open` | Reopen a durable job card |
+| `codex-job-cancel` | Stop one queued/running owned job and release its thread lock |
 | `codex-job-status` | Private widget polling endpoint |
 
 ### Let ChatGPT understand Codex first

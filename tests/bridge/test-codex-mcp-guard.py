@@ -34,6 +34,12 @@ READ_ONLY_ANNOTATIONS = {
     "idempotentHint": True,
     "openWorldHint": False,
 }
+CANCEL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
 
 
 FAKE_CODEX_SOURCE = r'''#!/usr/bin/python3
@@ -173,6 +179,23 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
     project_id = ""
     project_name = ""
     project_roots = []
+    launch_count = 0
+    if SCENARIO == "async_lock":
+        import fcntl
+        lock_stream = open(__file__ + ".session.lock", "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(78)
+        count_path = __file__ + ".launch-count"
+        try:
+            with open(count_path, "r", encoding="ascii") as count_file:
+                launch_count = int(count_file.read())
+        except (FileNotFoundError, ValueError):
+            launch_count = 0
+        launch_count += 1
+        with open(count_path, "w", encoding="ascii") as count_file:
+            count_file.write(str(launch_count))
 
     catalog_workspace = os.path.join(os.path.dirname(__file__), "workspace")
     catalog_repository = os.path.join(catalog_workspace, "repo-alpha")
@@ -256,6 +279,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
                 "projectId": project_id,
                 "projectName": project_name,
                 "projectRoots": project_roots,
+                "pid": os.getpid(),
             }, state_file, ensure_ascii=False, separators=(",", ":"))
 
     for raw_line in sys.stdin:
@@ -495,6 +519,9 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
                         },
                     })
             if SCENARIO == "async_block":
+                import time
+                time.sleep(60)
+            if SCENARIO == "async_lock" and launch_count == 1:
                 import time
                 time.sleep(60)
             if SCENARIO == "async_slow":
@@ -1002,6 +1029,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
+                "codex-job-cancel",
                 "codex-job-status",
                 "codex-overview",
                 "codex-project-list",
@@ -1013,7 +1041,10 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         )
         for tool in tools[:5]:
             self.assertEqual(tool["annotations"], SAFETY_ANNOTATIONS)
-        for tool in tools[5:]:
+        for tool in tools[5:7]:
+            self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
+        self.assertEqual(tools[7]["annotations"], CANCEL_ANNOTATIONS)
+        for tool in tools[8:]:
             self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
         self.assertEqual(tools[5]["_meta"]["ui"]["visibility"], ["model"])
         self.assertNotIn("resourceUri", tools[5]["_meta"]["ui"])
@@ -1023,9 +1054,9 @@ class CodexMcpGuardContractTest(unittest.TestCase):
             tools[6]["_meta"]["ui"]["resourceUri"],
             "ui://chatgpt-codex-bridge/job-status-v4.html",
         )
-        self.assertEqual(tools[7]["_meta"]["ui"]["visibility"], ["app"])
-        self.assertNotIn("resourceUri", tools[7]["_meta"]["ui"])
-        self.assertNotIn("openai/outputTemplate", tools[7]["_meta"])
+        self.assertEqual(tools[8]["_meta"]["ui"]["visibility"], ["app"])
+        self.assertNotIn("resourceUri", tools[8]["_meta"]["ui"])
+        self.assertNotIn("openai/outputTemplate", tools[8]["_meta"])
         self.assertEqual(
             tools[2]["_meta"]["openai/outputTemplate"],
             "ui://chatgpt-codex-bridge/job-status-v4.html",
@@ -1060,12 +1091,16 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         expected_statuses = [
             "queued", "running", "completed", "failed", "interrupted"
         ]
-        for tool in tools[2:8]:
+        for tool in tools[2:9]:
             self.assertEqual(
                 tool["outputSchema"]["properties"]["status"]["enum"],
                 expected_statuses,
             )
-        catalog_tools = tools[8:]
+        cancel_tool = tools[7]
+        self.assertEqual(cancel_tool["inputSchema"]["required"], ["jobId"])
+        self.assertIn("process tree", cancel_tool["description"])
+        self.assertIn("session lock", cancel_tool["description"])
+        catalog_tools = tools[9:]
         self.assertEqual(len(catalog_tools), 6)
         for tool in catalog_tools:
             self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
@@ -1314,6 +1349,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
+                "codex-job-cancel",
                 "codex-job-status",
                 "codex-overview",
                 "codex-project-list",
@@ -1504,6 +1540,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
+                "codex-job-cancel",
                 "codex-job-status",
                 "codex-overview",
                 "codex-project-list",
@@ -1619,6 +1656,240 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 return last
             time.sleep(0.05)
         raise AssertionError("job did not reach terminal state: " + repr(last))
+
+    def test_cancel_queued_job_before_execution(self):
+        module_spec = importlib.util.spec_from_file_location("guard_cancel_queue", GUARD)
+        guard_module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(guard_module)
+        workspace = self.root / "queued-workspace"
+        workspace.mkdir()
+        store = guard_module.JobStore(
+            str(self.root / "queued-jobs"),
+            "/usr/bin/true",
+            str(workspace),
+            "danger-full-access",
+            "never",
+            "/usr/bin/true",
+        )
+        internal_job_id = str(uuid.uuid4())
+        job_id = store.capabilities.encode("job", internal_job_id)
+        job_dir = store._internal_job_dir(internal_job_id)
+        job_dir.mkdir()
+        token = uuid.uuid4().hex
+        sentinel = job_dir / "executed"
+        fake_guard = self.root / "codex-mcp-guard.py"
+        fake_guard.write_text(
+            "import pathlib,sys,time\n"
+            "time.sleep(1)\n"
+            "pathlib.Path(sys.argv[sys.argv.index('--run-job')+1], 'executed').write_text('yes')\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen(
+            [
+                SYSTEM_PYTHON,
+                str(fake_guard),
+                "--run-job",
+                str(job_dir),
+                "--execution-token",
+                token,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            (job_dir / "status.json").write_text(json.dumps({
+                "jobId": job_id,
+                "internalJobId": internal_job_id,
+                "status": "queued",
+                "content": "queued fixture",
+                "updatedAt": time.time(),
+            }), encoding="utf-8")
+            (job_dir / "request.json").write_text(json.dumps({
+                "jobId": job_id,
+                "internalJobId": internal_job_id,
+                "executionToken": token,
+            }), encoding="utf-8")
+            (job_dir / "worker.json").write_text(json.dumps({
+                "pid": worker.pid,
+                "processGroupId": worker.pid,
+                "guardScript": str(fake_guard),
+                "jobDir": str(job_dir),
+                "executionToken": token,
+            }), encoding="utf-8")
+            cancelled = store.cancel(job_id)
+            self.assertEqual(cancelled["status"], "interrupted")
+            self.assertFalse(sentinel.exists())
+            self.assertIsNotNone(worker.poll())
+        finally:
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGKILL)
+                worker.wait(timeout=2)
+
+    def test_cancel_running_job_stops_execution_releases_lock_and_is_observable(self):
+        harness = self.harness(scenario="async_lock")
+        harness.initialize()
+        queued = harness.call(3, "codex-run", {"prompt": "hold session lock"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        deadline = time.time() + 4
+        running = None
+        while time.time() < deadline:
+            running = harness.call(4, "codex-job-status", {"jobId": job_id})[
+                "result"
+            ]["structuredContent"]
+            if running["status"] == "running" and running.get("threadId"):
+                break
+            time.sleep(0.03)
+        self.assertEqual(running["status"], "running")
+        app_server_pid = harness.read_child_state()["pid"]
+        os.kill(app_server_pid, 0)
+
+        cancelled = harness.call(5, "codex-job-cancel", {"jobId": job_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(cancelled["status"], "interrupted")
+        self.assertEqual(cancelled["nextAction"], "none")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(app_server_pid, 0)
+
+        repeated = harness.call(6, "codex-job-cancel", {"jobId": job_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(repeated["status"], "interrupted")
+        reopened = harness.call(7, "codex-job-open", {"jobId": job_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(reopened["status"], "interrupted")
+        jobs = harness.call(8, "codex-job-list", {
+            "status": "interrupted", "limit": 10
+        })["result"]["structuredContent"]["jobs"]
+        self.assertIn(job_id, [job["jobId"] for job in jobs])
+        overview_jobs = harness.call(9, "codex-overview", {})[
+            "result"
+        ]["structuredContent"]["jobs"]
+        self.assertIn(
+            job_id,
+            [job["jobId"] for job in overview_jobs if job["status"] == "interrupted"],
+        )
+
+        continued = harness.call(10, "codex-reply-async", {
+            "prompt": "continue after cancellation",
+            "threadId": cancelled["threadId"],
+        })
+        continued_job_id = continued["result"]["structuredContent"]["jobId"]
+        final = self.wait_for_job(harness, continued_job_id)["result"][
+            "structuredContent"
+        ]
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["threadId"], cancelled["threadId"])
+
+    def test_cancel_terminal_jobs_is_a_no_op(self):
+        harness = self.harness()
+        harness.initialize()
+        for index, status in enumerate(("completed", "failed", "interrupted"), 1):
+            job_id, _job_dir, _status_path = harness.write_job_fixture(
+                str(uuid.uuid4()), status, content=status + " fixture"
+            )
+            first = harness.call(20 + index, "codex-job-cancel", {"jobId": job_id})
+            second = harness.call(30 + index, "codex-job-cancel", {"jobId": job_id})
+            self.assertEqual(first["result"]["structuredContent"]["status"], status)
+            self.assertEqual(second["result"]["structuredContent"]["status"], status)
+
+    def test_cancel_one_running_job_does_not_stop_another(self):
+        harness = self.harness(scenario="async_block", max_active_jobs=2)
+        harness.initialize()
+        first_id = harness.call(3, "codex-run", {"prompt": "first"})[
+            "result"
+        ]["structuredContent"]["jobId"]
+        second_id = harness.call(4, "codex-run", {"prompt": "second"})[
+            "result"
+        ]["structuredContent"]["jobId"]
+        deadline = time.time() + 4
+        states = {}
+        while time.time() < deadline:
+            states = {
+                job_id: harness.call(50 + index, "codex-job-status", {"jobId": job_id})[
+                    "result"
+                ]["structuredContent"]
+                for index, job_id in enumerate((first_id, second_id))
+            }
+            if all(state["status"] == "running" for state in states.values()):
+                break
+            time.sleep(0.03)
+        self.assertTrue(all(state["status"] == "running" for state in states.values()))
+        second_worker = json.loads(
+            (harness.job_dir_for(second_id) / "worker.json").read_text(encoding="utf-8")
+        )
+
+        first = harness.call(60, "codex-job-cancel", {"jobId": first_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(first["status"], "interrupted")
+        os.kill(second_worker["pid"], 0)
+        second = harness.call(61, "codex-job-status", {"jobId": second_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(second["status"], "running")
+        cleanup = harness.call(62, "codex-job-cancel", {"jobId": second_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(cleanup["status"], "interrupted")
+
+    def test_cancel_completion_race_has_one_stable_terminal_state(self):
+        harness = self.harness(scenario="async_slow")
+        harness.initialize()
+        queued = harness.call(3, "codex-run", {"prompt": "race fixture"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        time.sleep(0.3)
+        raced = harness.call(4, "codex-job-cancel", {"jobId": job_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertIn(raced["status"], ("completed", "interrupted"))
+        repeated = harness.call(5, "codex-job-cancel", {"jobId": job_id})[
+            "result"
+        ]["structuredContent"]
+        self.assertEqual(repeated["status"], raced["status"])
+
+    def test_cancel_rejects_unowned_process_without_signalling_it(self):
+        harness = self.harness()
+        harness.initialize()
+        foreign = subprocess.Popen(
+            ["/bin/sleep", "30"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            job_id, job_dir, _status_path = harness.write_job_fixture(
+                str(uuid.uuid4()), "running", pid=foreign.pid
+            )
+            (job_dir / "worker.json").write_text(json.dumps({
+                "pid": foreign.pid,
+                "processGroupId": foreign.pid,
+                "guardScript": str(GUARD),
+                "jobDir": str(job_dir),
+                "executionToken": uuid.uuid4().hex,
+            }), encoding="utf-8")
+            worker_record = json.loads(
+                (job_dir / "worker.json").read_text(encoding="utf-8")
+            )
+            (job_dir / "request.json").write_text(json.dumps({
+                "jobId": job_id,
+                "internalJobId": job_dir.name,
+                "executionToken": worker_record["executionToken"],
+            }), encoding="utf-8")
+            rejected = harness.call(40, "codex-job-cancel", {"jobId": job_id})
+            self.assertEqual(rejected["error"]["code"], -32602)
+            self.assertIsNone(foreign.poll())
+            state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "running")
+        finally:
+            if foreign.poll() is None:
+                os.killpg(foreign.pid, signal.SIGTERM)
+                foreign.wait(timeout=2)
 
     def test_codex_run_uses_existing_workspace_without_project_bootstrap(self):
         harness = self.harness()

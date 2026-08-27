@@ -100,8 +100,9 @@ def main():
     fake_guard = workspace / "codex-mcp-guard.py"
     fake_guard.write_text(
         "import pathlib,subprocess,sys,time\n"
+        "job_dir=sys.argv[sys.argv.index('--run-job')+1]\n"
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
-        "pathlib.Path(sys.argv[-1],'child.pid').write_text(str(child.pid),encoding='ascii')\n"
+        "pathlib.Path(job_dir,'child.pid').write_text(str(child.pid),encoding='ascii')\n"
         "time.sleep(60)\n",
         encoding="utf-8",
     )
@@ -143,6 +144,69 @@ def main():
     assert worker.poll() is not None
     assert not guard_module.process_exists(child_pid)
     print("PASS: Windows verified worker-tree revocation")
+
+    cancel_root = workspace / "cancel-jobs"
+    store = guard_module.JobStore(
+        str(cancel_root),
+        arguments.codex_bin,
+        str(workspace),
+        "danger-full-access",
+        "never",
+        arguments.codex_bin,
+    )
+    cancel_internal_id = str(uuid.uuid4())
+    cancel_job_id = store.capabilities.encode("job", cancel_internal_id)
+    cancel_job_dir = cancel_root / cancel_internal_id
+    cancel_job_dir.mkdir()
+    execution_token = uuid.uuid4().hex
+    cancel_worker = subprocess.Popen(
+        [
+            sys.executable,
+            str(fake_guard),
+            "--run-job",
+            str(cancel_job_dir),
+            "--execution-token",
+            execution_token,
+        ],
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    (cancel_job_dir / "status.json").write_text(json.dumps({
+        "jobId": cancel_job_id,
+        "internalJobId": cancel_internal_id,
+        "status": "running",
+        "pid": cancel_worker.pid,
+        "content": "running fixture",
+        "updatedAt": time.time(),
+    }), encoding="utf-8")
+    (cancel_job_dir / "request.json").write_text(json.dumps({
+        "jobId": cancel_job_id,
+        "internalJobId": cancel_internal_id,
+        "executionToken": execution_token,
+    }), encoding="utf-8")
+    (cancel_job_dir / "worker.json").write_text(json.dumps({
+        "pid": cancel_worker.pid,
+        "processGroupId": cancel_worker.pid,
+        "guardScript": str(fake_guard),
+        "jobDir": str(cancel_job_dir),
+        "executionToken": execution_token,
+    }), encoding="utf-8")
+    cancel_child_path = cancel_job_dir / "child.pid"
+    deadline = time.monotonic() + 5
+    while not cancel_child_path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert cancel_child_path.is_file()
+    cancel_child_pid = int(cancel_child_path.read_text(encoding="ascii"))
+    cancelled = store.cancel(cancel_job_id)
+    assert cancelled["status"] == "interrupted"
+    assert cancel_worker.poll() is not None
+    assert not guard_module.process_exists(cancel_child_pid)
+    assert store.cancel(cancel_job_id)["status"] == "interrupted"
+    print("PASS: Windows job cancel stops verified worker process tree")
 
 
 if __name__ == "__main__":

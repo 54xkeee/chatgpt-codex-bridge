@@ -671,6 +671,30 @@ def build_public_tools(sandbox, approval_policy):
             "_meta": async_tool_meta(["model", "app"]),
         },
         {
+            "name": "codex-job-cancel",
+            "title": "Cancel Codex Background Job",
+            "description": (
+                "Cancel one existing durable Codex job by its signed jobId. "
+                "Queued work will not start; running work and its owned process "
+                "tree are stopped so the Codex thread/session lock is released. "
+                "Repeated calls and terminal jobs return the current state as a no-op."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"jobId": {"type": "string"}},
+                "required": ["jobId"],
+            },
+            "outputSchema": ASYNC_OUTPUT_SCHEMA,
+            "annotations": {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+            "_meta": {"ui": {"visibility": ["model"]}},
+        },
+        {
             "name": "codex-job-status",
             "title": "Read Codex Background Job",
             "description": "Read one durable Codex job without waiting.",
@@ -1153,6 +1177,29 @@ def process_exists(pid):
     return True
 
 
+def managed_process_running(pid):
+    if not process_exists(pid):
+        return False
+    if os.name == "nt":
+        return True
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "stat="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+            check=False,
+            env=filtered_child_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return not (
+        completed.returncode == 0 and completed.stdout.lstrip().startswith("Z")
+    )
+
+
 def _canonical_optional_directory(raw_path):
     if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
         raise GuardConfigurationError()
@@ -1222,7 +1269,9 @@ def _windows_process_arguments(pid):
         ctypes.windll.kernel32.LocalFree(argv)
 
 
-def _worker_command_matches(pid, job_dir, recorded_guard=""):
+def _worker_command_matches(
+    pid, job_dir, recorded_guard="", execution_token="", require_token=False
+):
     if os.name == "nt":
         try:
             arguments = _windows_process_arguments(pid)
@@ -1266,13 +1315,25 @@ def _worker_command_matches(pid, job_dir, recorded_guard=""):
             recorded_guard
         ):
             return False
+    if execution_token:
+        try:
+            token_index = arguments.index("--execution-token")
+        except ValueError:
+            return False
+        if (
+            token_index + 1 >= len(arguments)
+            or arguments[token_index + 1] != execution_token
+        ):
+            return False
+    elif require_token:
+        return False
     return True
 
 
-def _mark_job_interrupted(job_dir, state):
+def _mark_job_interrupted(job_dir, state, content="", next_action="repair"):
     if state.get("status") not in ACTIVE_JOB_STATUSES:
         return
-    content = state.get("content") or "本机 Codex 后台进程已被安全撤销。"
+    content = content or state.get("content") or "本机 Codex 后台进程已被安全撤销。"
     state.update({
         "status": "interrupted",
         "content": content,
@@ -1280,11 +1341,94 @@ def _mark_job_interrupted(job_dir, state):
         "activity": content,
         "lastEventAt": time.time(),
         "failureStage": state.get("phase", "working"),
-        "nextAction": "repair",
+        "nextAction": next_action,
         "updatedAt": time.time(),
     })
-    finish_job_report(state, "interrupted", content, "repair")
+    finish_job_report(state, "interrupted", content, next_action)
     atomic_write_json(job_dir / "status.json", state)
+
+
+def _managed_worker_pid(job_dir, worker, require_execution_token=False):
+    pid = worker.get("pid")
+    if not managed_process_running(pid):
+        return None
+    process_group_id = worker.get("processGroupId", pid)
+    recorded_job_dir = worker.get("jobDir", str(job_dir))
+    recorded_guard = worker.get("guardScript", "")
+    execution_token = worker.get("executionToken", "")
+    if os.name == "nt":
+        live_process_group_id = pid
+    else:
+        try:
+            live_process_group_id = os.getpgid(pid)
+        except ProcessLookupError:
+            return None
+        except (OSError, PermissionError) as error:
+            raise GuardProtocolError(
+                "managed worker ownership could not be verified"
+            ) from error
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or process_group_id != pid
+        or recorded_job_dir != str(job_dir)
+        or live_process_group_id != pid
+        or not isinstance(execution_token, str)
+        or not _worker_command_matches(
+            pid,
+            job_dir,
+            recorded_guard,
+            execution_token,
+            require_execution_token,
+        )
+    ):
+        raise GuardProtocolError("managed worker ownership could not be verified")
+    return pid
+
+
+def _terminate_managed_worker(
+    job_dir, worker, wait_seconds=3.0, require_execution_token=False
+):
+    pid = _managed_worker_pid(job_dir, worker, require_execution_token)
+    if pid is None:
+        return False
+    if os.name == "nt":
+        taskkill = os.path.join(
+            os.environ.get("SYSTEMROOT", r"C:\Windows"),
+            "System32",
+            "taskkill.exe",
+        )
+        try:
+            subprocess.run(
+                [taskkill, "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(15.0, wait_seconds),
+                check=False,
+                env=filtered_child_environment(),
+            )
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + wait_seconds
+    while managed_process_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if managed_process_running(pid) and os.name != "nt":
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        kill_deadline = time.monotonic() + 1.0
+        while managed_process_running(pid) and time.monotonic() < kill_deadline:
+            time.sleep(0.05)
+    if managed_process_running(pid):
+        raise GuardProtocolError("managed worker did not stop")
+    return True
 
 
 def revoke_managed_workers(raw_root, wait_seconds=3.0):
@@ -1312,70 +1456,10 @@ def revoke_managed_workers(raw_root, wait_seconds=3.0):
         if worker_path.is_symlink() or not worker_path.is_file():
             raise GuardProtocolError("managed worker record unavailable")
         worker = read_json_object(worker_path)
-        pid = worker.get("pid")
-        if not process_exists(pid):
+        if not managed_process_running(worker.get("pid")):
             _mark_job_interrupted(job_dir, state)
             continue
-        process_group_id = worker.get("processGroupId", pid)
-        recorded_job_dir = worker.get("jobDir", str(job_dir))
-        recorded_guard = worker.get("guardScript", "")
-        if os.name == "nt":
-            live_process_group_id = pid
-        else:
-            try:
-                live_process_group_id = os.getpgid(pid)
-            except ProcessLookupError:
-                _mark_job_interrupted(job_dir, state)
-                continue
-            except (OSError, PermissionError) as error:
-                raise GuardProtocolError(
-                    "managed worker ownership could not be verified"
-                ) from error
-        if (
-            isinstance(pid, bool)
-            or not isinstance(pid, int)
-            or process_group_id != pid
-            or recorded_job_dir != str(job_dir)
-            or live_process_group_id != pid
-            or not _worker_command_matches(pid, job_dir, recorded_guard)
-        ):
-            raise GuardProtocolError("managed worker ownership could not be verified")
-        if os.name == "nt":
-            taskkill = os.path.join(
-                os.environ.get("SYSTEMROOT", r"C:\Windows"),
-                "System32",
-                "taskkill.exe",
-            )
-            try:
-                subprocess.run(
-                    [taskkill, "/PID", str(pid), "/T", "/F"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=max(15.0, wait_seconds),
-                    check=False,
-                    env=filtered_child_environment(),
-                )
-            except subprocess.TimeoutExpired:
-                pass
-        else:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + wait_seconds
-        while process_exists(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if process_exists(pid) and os.name != "nt":
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            kill_deadline = time.monotonic() + 1.0
-            while process_exists(pid) and time.monotonic() < kill_deadline:
-                time.sleep(0.05)
-        if process_exists(pid):
-            raise GuardProtocolError("managed worker did not stop")
+        _terminate_managed_worker(job_dir, worker, wait_seconds)
         _mark_job_interrupted(job_dir, state)
         revoked += 1
     return revoked
@@ -1388,7 +1472,9 @@ def purge_job_state(raw_root):
     revoke_managed_workers(str(root))
     removed = 0
     allowed_root_files = {"capability.key", "admission.lock"}
-    allowed_job_files = {"request.json", "status.json", "worker.json"}
+    allowed_job_files = {
+        "request.json", "status.json", "worker.json", "cancel.json"
+    }
     for child in sorted(root.iterdir(), key=lambda item: item.name):
         if child.is_symlink():
             raise GuardProtocolError("unsafe job state entry")
@@ -1408,7 +1494,7 @@ def purge_job_state(raw_root):
             if item.is_symlink() or not item.is_file():
                 raise GuardProtocolError("unsafe job record")
             temporary_record = re.fullmatch(
-                r"(?:request|status|worker)\.json\.tmp\.[0-9a-f]{32}", item.name
+                r"(?:request|status|worker|cancel)\.json\.tmp\.[0-9a-f]{32}", item.name
             )
             if item.name not in allowed_job_files and temporary_record is None:
                 raise GuardProtocolError("unknown job record")
@@ -1687,6 +1773,34 @@ def missing_project_scaffold(workspace):
     return missing
 
 
+def locked_lifecycle(lock_path):
+    descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+
+    class LifecycleLock:
+        def __enter__(inner_self):
+            if os.name == "nt":
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                    os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return descriptor
+
+        def __exit__(inner_self, _type, _value, _traceback):
+            try:
+                if os.name == "nt":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    return LifecycleLock()
+
+
 class JobStore:
     def __init__(
         self,
@@ -1746,35 +1860,7 @@ class JobStore:
         return self._internal_job_dir(internal_job_id)
 
     def _locked_admission(self):
-        descriptor = os.open(
-            str(self.lock_path),
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
-
-        class AdmissionLock:
-            def __enter__(inner_self):
-                if os.name == "nt":
-                    if os.fstat(descriptor).st_size == 0:
-                        os.write(descriptor, b"\0")
-                        os.fsync(descriptor)
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
-                else:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
-                return descriptor
-
-            def __exit__(inner_self, _type, _value, _traceback):
-                try:
-                    if os.name == "nt":
-                        os.lseek(descriptor, 0, os.SEEK_SET)
-                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-                    else:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
-                finally:
-                    os.close(descriptor)
-
-        return AdmissionLock()
+        return locked_lifecycle(self.lock_path)
 
     def _job_directories(self):
         directories = []
@@ -1954,6 +2040,7 @@ class JobStore:
                 )
             internal_job_id = str(uuid.uuid4())
             job_id = self.capabilities.encode("job", internal_job_id)
+            execution_token = uuid.uuid4().hex
             path = self._internal_job_dir(internal_job_id)
             path.mkdir(mode=0o700)
             created_at = time.time()
@@ -1988,6 +2075,7 @@ class JobStore:
                 "existingWorkspace": existing_workspace,
                 "projectName": display_name,
                 "projectId": project_id,
+                "executionToken": execution_token,
                 "createdAt": created_at,
             }
             state = {
@@ -2033,6 +2121,8 @@ class JobStore:
                 self.workspace,
                 "--job-max-seconds",
                 str(self.job_max_seconds),
+                "--execution-token",
+                execution_token,
                 "--sandbox",
                 self.sandbox,
                 "--approval-policy",
@@ -2066,6 +2156,7 @@ class JobStore:
                     "processGroupId": worker.pid,
                     "guardScript": os.path.realpath(__file__),
                     "jobDir": str(path),
+                    "executionToken": execution_token,
                     "startedAt": time.time(),
                 })
             except OSError as error:
@@ -2120,6 +2211,62 @@ class JobStore:
             time.sleep(min(JOB_WAIT_POLL_SECONDS, remaining))
             state = self.read(job_id)
         return state
+
+    def cancel(self, job_id):
+        path = self.job_dir(job_id)
+        if not path.is_dir():
+            raise GuardProtocolError("unknown job id")
+        with self._locked_admission():
+            state = self._state_for_path(path, reconcile=False)
+            if state.get("jobId") != job_id:
+                raise GuardProtocolError("invalid job state")
+            if state.get("status") not in ACTIVE_JOB_STATUSES:
+                return state
+
+            worker_path = path / "worker.json"
+            if worker_path.is_symlink():
+                raise GuardProtocolError("invalid job state")
+            worker = (
+                read_json_object(worker_path)
+                if worker_path.is_file()
+                else {"pid": None}
+            )
+            if managed_process_running(worker.get("pid")):
+                request = read_json_object(path / "request.json")
+                if (
+                    request.get("jobId") != job_id
+                    or request.get("internalJobId") != path.name
+                    or not isinstance(request.get("executionToken"), str)
+                    or request.get("executionToken") != worker.get("executionToken")
+                ):
+                    raise GuardProtocolError(
+                        "managed worker ownership could not be verified"
+                    )
+                _managed_worker_pid(path, worker, require_execution_token=True)
+
+            requested_at = time.time()
+            atomic_write_json(path / "cancel.json", {
+                "jobId": job_id,
+                "internalJobId": path.name,
+                "executionToken": worker.get("executionToken", ""),
+                "requestedAt": requested_at,
+            })
+            if managed_process_running(worker.get("pid")):
+                _terminate_managed_worker(
+                    path,
+                    worker,
+                    require_execution_token=True,
+                )
+
+            state = self._state_for_path(path, reconcile=False)
+            if state.get("status") in ACTIVE_JOB_STATUSES:
+                _mark_job_interrupted(
+                    path,
+                    state,
+                    "Codex 后台任务已取消，线程会话锁已释放。",
+                    "none",
+                )
+            return self._state_for_path(path, reconcile=False)
 
 
 def resolve_workspace_new_project_skill(configured_path=""):
@@ -2932,6 +3079,7 @@ def run_job(
     workspace_new_project_skill="",
     capability_key_path="",
     capability_workspace="",
+    execution_token="",
     job_max_seconds=JOB_MAX_SECONDS_DEFAULT,
 ):
     path = Path(job_dir)
@@ -2956,6 +3104,7 @@ def run_job(
     existing_workspace = request.get("existingWorkspace", False)
     project_name = request.get("projectName", "")
     project_id = request.get("projectId", "")
+    requested_execution_token = request.get("executionToken", "")
     if not isinstance(prompt, str) or not prompt:
         return EXIT_CONFIG
     if not isinstance(requested_thread, str) or not isinstance(
@@ -2973,25 +3122,39 @@ def run_job(
         or not isinstance(existing_workspace, bool)
         or not isinstance(project_name, str)
         or not isinstance(project_id, str)
+        or not isinstance(requested_execution_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", requested_execution_token)
+        or requested_execution_token != execution_token
         or (existing_workspace and (bootstrap_required or bool(requested_thread)))
     ):
         return EXIT_CONFIG
 
-    state = read_json_object(path / "status.json")
-    now = time.time()
-    state.update({
-        "status": "running",
-        "pid": os.getpid(),
-        "content": "Codex 正在本机后台工作。",
-        "phase": "starting",
-        "activity": "正在启动 Codex App Server。",
-        "lastEventAt": now,
-        "failureStage": "",
-        "nextAction": "wait",
-        "report": state.get("report") if isinstance(state.get("report"), dict) else initial_job_report(),
-        "updatedAt": now,
-    })
-    atomic_write_json(path / "status.json", state)
+    with locked_lifecycle(path.parent / "admission.lock"):
+        state = read_json_object(path / "status.json")
+        if state.get("status") != "queued":
+            return EXIT_PROTOCOL
+        if (path / "cancel.json").is_file():
+            _mark_job_interrupted(
+                path,
+                state,
+                "Codex 后台任务已取消，线程会话锁已释放。",
+                "none",
+            )
+            return EXIT_PROTOCOL
+        now = time.time()
+        state.update({
+            "status": "running",
+            "pid": os.getpid(),
+            "content": "Codex 正在本机后台工作。",
+            "phase": "starting",
+            "activity": "正在启动 Codex App Server。",
+            "lastEventAt": now,
+            "failureStage": "",
+            "nextAction": "wait",
+            "report": state.get("report") if isinstance(state.get("report"), dict) else initial_job_report(),
+            "updatedAt": now,
+        })
+        atomic_write_json(path / "status.json", state)
 
     if (sandbox, approval_policy) != ("danger-full-access", "never"):
         failure_content = "当前异步工作器只支持 personal-full-control 预设。"
@@ -3421,7 +3584,19 @@ def run_job(
     finally:
         if client is not None:
             client.close()
-    atomic_write_json(path / "status.json", state)
+    with locked_lifecycle(path.parent / "admission.lock"):
+        durable_state = read_json_object(path / "status.json")
+        if durable_state.get("status") not in ACTIVE_JOB_STATUSES:
+            state = durable_state
+        elif (path / "cancel.json").is_file():
+            _mark_job_interrupted(
+                path,
+                state,
+                "Codex 后台任务已取消，线程会话锁已释放。",
+                "none",
+            )
+        else:
+            atomic_write_json(path / "status.json", state)
     return 0 if state["status"] == "completed" else EXIT_PROTOCOL
 
 
@@ -3793,6 +3968,19 @@ class CodexMcpGuard:
                 return
             self.emit(wait_tool_result(request_id, state))
             return
+        if name == "codex-job-cancel":
+            if set(arguments) != {"jobId"} or not isinstance(
+                arguments.get("jobId"), str
+            ):
+                self.invalid_params(request_id)
+                return
+            try:
+                state = self.job_store.cancel(arguments["jobId"])
+            except GuardProtocolError:
+                self.invalid_params(request_id, "Unknown, invalid, or unowned jobId")
+                return
+            self.emit(job_tool_result(request_id, state))
+            return
         if name in ("codex-job-open", "codex-job-status"):
             if set(arguments) != {"jobId"} or not isinstance(arguments.get("jobId"), str):
                 self.invalid_params(request_id)
@@ -4054,6 +4242,7 @@ class CodexMcpGuard:
                 "codex-reply-async",
                 "codex-wait",
                 "codex-job-open",
+                "codex-job-cancel",
                 "codex-job-status",
             ):
                 self.handle_async_call(message, params)
@@ -4487,6 +4676,7 @@ def parse_worker_configuration(argv):
     parser.add_argument("--workspace-new-project-skill", default="")
     parser.add_argument("--capability-key-path", required=True)
     parser.add_argument("--capability-workspace", required=True)
+    parser.add_argument("--execution-token", required=True)
     parser.add_argument("--job-max-seconds", type=float, required=True)
     parser.add_argument(
         "--sandbox",
@@ -4525,6 +4715,8 @@ def parse_worker_configuration(argv):
         or arguments.job_max_seconds > JOB_MAX_SECONDS_LIMIT
     ):
         raise GuardConfigurationError()
+    if not re.fullmatch(r"[0-9a-f]{32}", arguments.execution_token):
+        raise GuardConfigurationError()
     workspace_new_project_skill = arguments.workspace_new_project_skill
     if workspace_new_project_skill:
         workspace_new_project_skill = require_real_absolute_path(
@@ -4541,6 +4733,7 @@ def parse_worker_configuration(argv):
         workspace_new_project_skill,
         capability_key_path,
         capability_workspace,
+        arguments.execution_token,
         arguments.job_max_seconds,
     )
 

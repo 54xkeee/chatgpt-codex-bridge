@@ -14,6 +14,8 @@ Mutable execution tools:
 - `codex-run(prompt)` — durable new thread in the configured existing workspace.
 - `codex-start(prompt, projectName?)` — durable new sidebar project/task.
 - `codex-reply-async(prompt, threadId)` — durable exact-thread reply.
+- `codex-job-cancel(jobId)` — idempotently stop one verified Bridge-owned
+  queued/running worker tree and return its durable terminal state.
 
 Read-only job tools:
 
@@ -38,8 +40,8 @@ preset retains only its bounded synchronous tools.
 - `codex-job-list(status?, limit?, cursor?)` — durable Bridge job summaries,
   optionally filtered by status.
 
-The execution tools create or continue work. All wait/open/status/catalog tools
-only inspect state. The public descriptions must stay truthful about thread
+The execution tools create, continue, or cancel work. All wait/open/status/catalog
+tools only inspect state. The public descriptions must stay truthful about thread
 identity, project identity, catalog scope, and status transitions. Catalog
 pages default to 20 entries and accept at most 100 entries. Their cursors are
 signed and scoped to the corresponding list or thread history.

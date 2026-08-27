@@ -306,6 +306,8 @@ Windows 安装或升级后可用它确认 ChatGPT 命中的运行时与本机文
 - 新项目：`codex-start` → 重复 `codex-wait`；
 - 同项目继续：`codex-reply-async` → 重复 `codex-wait`；
 - 旧卡片恢复：`codex-job-open`，不要重复 `codex-start`；
+- 取消任务：`codex-job-cancel(jobId)`；它会终止该任务受 Bridge 跟踪的完整
+  worker 进程树，随后写入 `interrupted`，因此 Codex GUI 可重新打开该 thread；
 - `codex` / `codex-reply` 只用于短诊断。
 
 ## 已踩过的坑
