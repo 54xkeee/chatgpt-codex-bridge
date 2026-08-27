@@ -1,0 +1,62 @@
+# Job control, transcript, and handoff design
+
+## Boundary
+
+ChatGPT is the controller. The bridge provides durable execution primitives and truthful observation; it does not decide the user's task graph. A durable worker owns one App Server writer while its turn is active. Codex Desktop may inspect persisted history, but writable takeover is advertised only after that worker releases the App Server.
+
+## Durable state additions
+
+`status.json` gains backwards-compatible optional fields:
+
+- `workspace`, `projectName` — human-readable task location;
+- `transcript[]` — bounded public audit entries (`controller` prompt/steer/cancel and `codex` agent/plan messages only);
+- `writerActive` — whether this worker currently owns the App Server writer;
+- `threadHandoff` — `pending`, `bridge-owned`, `available`, or `unavailable`;
+- `internalTurnId` — worker-internal active turn linkage, never emitted publicly.
+
+`request.json` stores both `userPrompt` and the bridge-wrapped `prompt`. The public transcript uses `userPrompt`, so bridge-only return contracts/bootstrap text are not misrepresented as user/controller intent.
+
+A per-job `controls.json` contains bounded controller commands. It is inside the already capability-scoped job directory and is created/updated atomically. It is not a generic queue: accepted kinds are only `steer` and `cancel`.
+
+## Control flow
+
+### Steer
+
+1. Guard validates the signed `jobId` and that the job is running with an active turn.
+2. Guard appends a `steer` command and transcript entry.
+3. Worker polls control state while reading App Server events.
+4. Worker sends `turn/steer` with the exact internal thread ID and `expectedTurnId`.
+5. The same durable job remains active; no new thread is created.
+
+### Cancel
+
+1. Terminal job: return unchanged.
+2. Queued job: atomically mark interrupted before launch; worker refuses to start a non-queued job.
+3. Running job: append `cancel`; worker sends exact `turn/interrupt`.
+4. Guard waits a short grace interval. If the job does not become terminal, it invokes the existing verified worker ownership checks and kills only that job's process tree.
+5. State becomes `interrupted`, writer ownership is cleared, and handoff becomes available when a thread exists.
+
+This intentionally avoids repeated `turn/interrupt` calls: bridge-level cancellation is idempotent even if an upstream App Server does not tolerate repeated interruption cleanly.
+
+## Wait
+
+`codex-wait` accepts optional `timeoutSeconds`. The default increases from 45 seconds to 52 seconds; the existing 55-second hard ceiling remains because the Secure MCP request itself is bounded. The tool returns current state after the interval. Continuous polling is a controller choice, not a transport invariant.
+
+## Transcript
+
+The worker records only public App Server items:
+- `agentMessage` text;
+- `plan` text;
+- controller prompt/steer/cancel text.
+
+`reasoning` items remain filtered. Command/file/tool activity stays in the existing structured report and in `codex-thread-read` history. Transcript entries are bounded and mark truncation when necessary.
+
+## Handoff
+
+The bridge reports `threadHandoff=bridge-owned` while its worker App Server owns the thread writer. The worker closes the App Server in `finally`, then records `writerActive=false` and `threadHandoff=available` when a signed thread exists. Cancellation fallback makes the same state transition only after verified worker termination.
+
+The design does not create a second App Server writer and does not claim that Codex Desktop can write the thread concurrently.
+
+## Compatibility
+
+Older job records have no transcript/handoff fields. Public projection supplies safe defaults. Existing tool names and job capability format remain unchanged. The new controls are additive.
