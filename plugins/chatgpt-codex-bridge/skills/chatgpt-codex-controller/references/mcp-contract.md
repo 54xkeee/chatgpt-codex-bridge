@@ -95,3 +95,8 @@ ChatGPT conversation-principal authentication.
 Default async limits are 256 KiB per prompt, two active jobs, 512 retained job
 records, and four hours per App Server worker. Limit failures are MCP admission
 errors and do not allocate a project or worker.
+
+
+## Scoped job controls
+
+`codex-job-status(jobId)` is the immediate model-visible snapshot. It includes the bounded public transcript, report, and writer/handoff state. `codex-job-steer(jobId,prompt)` targets the exact active turn through App Server `turn/steer`. `codex-job-cancel(jobId,reason?)` is idempotent, requests exact `turn/interrupt` first, and only then falls back to verified termination of that job's bridge-owned worker. `codex-wait(jobId,timeoutSeconds?)` is a bounded join and may return an active state.
