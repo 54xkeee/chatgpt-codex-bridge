@@ -8,4 +8,4 @@
 - [x] T6 Record controller prompts/steers/cancel reasons and public Codex messages without private reasoning.
 - [x] T7 Add focused contract/integration tests for wait, transcript, steer, cancel, fallback, and handoff.
 - [x] T8 Update controller/MCP documentation and package mirror.
-- [ ] T9 Run the complete repository CI test commands and review the final diff.
+- [x] T9 Run the complete repository CI test commands and review the final diff.
