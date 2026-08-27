@@ -2766,6 +2766,34 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertEqual(too_long["error"]["code"], -32602)
 
 
+
+    def test_running_steer_is_immediately_visible_in_public_transcript(self):
+        harness = self.harness(scenario="async_block", job_max_seconds=60)
+        harness.initialize()
+        queued = harness.call(3, "codex-run", {"prompt": "steer blocked turn"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        status_path = harness.job_dir_for(job_id) / "status.json"
+        deadline = time.time() + 3.0
+        state = {}
+        while time.time() < deadline:
+            state = json.loads(status_path.read_text(encoding="utf-8"))
+            if state.get("status") == "running" and state.get("internalTurnId"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(state.get("status"), "running")
+
+        steered = harness.call(4, "codex-job-steer", {
+            "jobId": job_id,
+            "prompt": "change direction immediately",
+        })["result"]["structuredContent"]
+        steer_entries = [
+            entry for entry in steered["transcript"]
+            if entry.get("kind") == "steer"
+        ]
+        self.assertEqual([entry["text"] for entry in steer_entries], ["change direction immediately"])
+        self.assertIn(steer_entries[0]["delivery"], ("queued", "sent"))
+        harness.call(5, "codex-job-cancel", {"jobId": job_id, "reason": "cleanup"})
+
     def test_running_cancel_falls_back_to_verified_worker_and_is_idempotent(self):
         harness = self.harness(scenario="async_block", job_max_seconds=60)
         harness.initialize()
@@ -2792,6 +2820,11 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertEqual(cancelled["threadHandoff"], "available")
         self.assertEqual(cancelled["nextAction"], "continue")
         self.assertIn("threadId", cancelled)
+        cancel_entries = [
+            entry for entry in cancelled["transcript"]
+            if entry.get("kind") == "cancel"
+        ]
+        self.assertEqual([entry["text"] for entry in cancel_entries], ["user requested takeover"])
 
         durable = json.loads(status_path.read_text(encoding="utf-8"))
         worker = json.loads((job_dir / "worker.json").read_text(encoding="utf-8"))

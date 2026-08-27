@@ -19,7 +19,7 @@ ChatGPT is the controller. The bridge provides durable execution primitives and 
 
 A per-job `controls.json` contains bounded controller commands. It is inside the already capability-scoped job directory and is created/updated atomically. It is not a generic queue: accepted kinds are only `steer` and `cancel`.
 
-During an active job, the controller writes only the control mailbox. The worker remains the single writer of running `status.json` and records the corresponding public transcript entry when it sends the control to App Server. This avoids controller/worker lost-update races.
+During an active job, the controller writes only the control mailbox. The worker remains the single writer of running `status.json` and records the corresponding public transcript entry when it sends the control to App Server. Read/status projection overlays any still-pending mailbox entries in memory, without persisting them back to running state. This avoids controller/worker lost-update races while making the audit view immediately complete.
 
 ## Control flow
 

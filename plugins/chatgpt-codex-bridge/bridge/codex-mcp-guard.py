@@ -2330,7 +2330,7 @@ class JobStore:
         state = self._state_for_path(path)
         if state.get("jobId") != job_id:
             raise GuardProtocolError("invalid job state")
-        return state
+        return self._overlay_control_transcript(path, state)
 
     def list(self, status=None):
         if status is not None and status not in ALL_JOB_STATUSES:
@@ -2338,7 +2338,9 @@ class JobStore:
         states = []
         for path in self._job_directories():
             try:
-                state = self._state_for_path(path)
+                state = self._overlay_control_transcript(
+                    path, self._state_for_path(path)
+                )
             except GuardProtocolError:
                 continue
             if status is None or state.get("status") == status:
@@ -2360,6 +2362,39 @@ class JobStore:
         atomic_write_json(control_path, {"commands": commands})
         return control_id
 
+    def _overlay_control_transcript(self, path, state):
+        control_path = path / "controls.json"
+        if control_path.is_symlink():
+            raise GuardProtocolError("invalid job control state")
+        if not control_path.is_file():
+            return state
+        existing_ids = {
+            entry.get("controlId")
+            for entry in state.get("transcript", [])
+            if isinstance(entry, dict) and isinstance(entry.get("controlId"), str)
+        }
+        for command in read_controls(path):
+            if not isinstance(command, dict):
+                raise GuardProtocolError("invalid job control state")
+            control_id = command.get("id")
+            kind = command.get("kind")
+            if not isinstance(control_id, str) or not control_id or control_id in existing_ids:
+                continue
+            if kind == "steer":
+                value = command.get("prompt")
+            elif kind == "cancel":
+                value = command.get("reason")
+            else:
+                raise GuardProtocolError("invalid job control command")
+            if not isinstance(value, str):
+                raise GuardProtocolError("invalid job control command")
+            append_transcript(
+                state, "controller", kind, value, command.get("createdAt"),
+                "queued", control_id
+            )
+            existing_ids.add(control_id)
+        return state
+
     def steer(self, job_id, prompt):
         if (
             not isinstance(prompt, str)
@@ -2373,7 +2408,9 @@ class JobStore:
             if state.get("status") != "running" or not state.get("internalTurnId"):
                 raise GuardProtocolError("job has no steerable active turn")
             self._append_control_locked(path, state, "steer", prompt)
-            return self._state_for_path(path, reconcile=False)
+            return self._overlay_control_transcript(
+                path, self._state_for_path(path, reconcile=False)
+            )
 
     def cancel(self, job_id, reason=""):
         if not isinstance(reason, str) or len(reason) > 4000:
@@ -2383,7 +2420,7 @@ class JobStore:
             path = self.job_dir(job_id)
             state = self._state_for_path(path)
             if state.get("status") in TERMINAL_JOB_STATUSES:
-                return state
+                return self._overlay_control_transcript(path, state)
             if state.get("status") == "queued":
                 message = reason or "Codex 后台任务已在启动前取消。"
                 queued = True
@@ -2402,7 +2439,7 @@ class JobStore:
                 )
                 _mark_job_interrupted(path, state, message)
                 state = self._state_for_path(path, reconcile=False)
-            return state
+            return self._overlay_control_transcript(path, state)
         deadline = time.monotonic() + JOB_CANCEL_GRACE_SECONDS
         state = self.read(job_id)
         while state.get("status") in ACTIVE_JOB_STATUSES and time.monotonic() < deadline:
@@ -2418,7 +2455,7 @@ class JobStore:
                     path, state, reason or "Codex 后台任务已取消并释放线程写入权。"
                 )
             state = self._state_for_path(path, reconcile=False)
-        return state
+        return self._overlay_control_transcript(path, state)
 
     def wait(self, job_id, timeout_seconds):
         deadline = time.monotonic() + timeout_seconds
