@@ -1,0 +1,35 @@
+name: Apply job control patch
+
+on:
+  push:
+    branches:
+      - feat/job-control-transcript-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[controller-patch-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/job-control-transcript-handoff
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply deterministic patch
+        run: python3 scripts/dev/apply_job_control_patch.py
+      - name: Syntax and package identity checks
+        run: |
+          python3 -m py_compile scripts/bridge/codex-mcp-guard.py
+          cmp scripts/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/bridge/codex-mcp-guard.py
+          git diff --check
+      - name: Commit generated implementation
+        run: |
+          git config user.name 'chatgpt-controller'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/skills/chatgpt-codex-controller/SKILL.md plugins/chatgpt-codex-bridge/skills/chatgpt-codex-controller/references/controller-loop.md plugins/chatgpt-codex-bridge/skills/chatgpt-codex-controller/references/mcp-contract.md docs/specs/job-control-transcript-handoff/tasks.md
+          git commit -m 'feat: add scoped Codex job controls [controller-patch-applied]'
+          git push origin HEAD:feat/job-control-transcript-handoff
