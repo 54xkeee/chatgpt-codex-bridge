@@ -21,6 +21,8 @@ jobs:
           python-version: '3.12'
       - name: Apply race fix and focused tests
         run: python3 scripts/dev/apply_job_control_fixup.py
+      - name: Apply compatibility and cancellation finalizer
+        run: python3 scripts/dev/apply_job_control_finalize.py
       - name: Run full guard contract suite
         run: |
           python3 -m py_compile scripts/bridge/codex-mcp-guard.py
