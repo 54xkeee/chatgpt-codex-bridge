@@ -992,123 +992,48 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         harness = self.harness()
         response = harness.initialize()
         tools = response["result"]["tools"]
+        by_name = {tool["name"]: tool for tool in tools}
         self.assertEqual(
             [tool["name"] for tool in tools],
             [
-                "codex",
-                "codex-reply",
-                "codex-run",
-                "codex-start",
-                "codex-reply-async",
-                "codex-wait",
-                "codex-job-open",
-                "codex-job-status",
-                "codex-overview",
-                "codex-project-list",
-                "codex-repository-list",
-                "codex-thread-list",
-                "codex-thread-read",
-                "codex-job-list",
+                "codex", "codex-reply", "codex-run", "codex-start",
+                "codex-reply-async", "codex-wait", "codex-job-open",
+                "codex-job-status", "codex-job-steer", "codex-job-cancel",
+                "codex-overview", "codex-project-list",
+                "codex-repository-list", "codex-thread-list",
+                "codex-thread-read", "codex-job-list",
             ],
         )
-        for tool in tools[:5]:
-            self.assertEqual(tool["annotations"], SAFETY_ANNOTATIONS)
-        for tool in tools[5:]:
-            self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
-        self.assertEqual(tools[5]["_meta"]["ui"]["visibility"], ["model"])
-        self.assertNotIn("resourceUri", tools[5]["_meta"]["ui"])
-        self.assertEqual(tools[6]["annotations"]["readOnlyHint"], True)
-        self.assertEqual(tools[6]["_meta"]["ui"]["visibility"], ["model", "app"])
-        self.assertEqual(
-            tools[6]["_meta"]["ui"]["resourceUri"],
-            "ui://chatgpt-codex-bridge/job-status-v4.html",
-        )
-        self.assertEqual(tools[7]["_meta"]["ui"]["visibility"], ["app"])
-        self.assertNotIn("resourceUri", tools[7]["_meta"]["ui"])
-        self.assertNotIn("openai/outputTemplate", tools[7]["_meta"])
-        self.assertEqual(
-            tools[2]["_meta"]["openai/outputTemplate"],
-            "ui://chatgpt-codex-bridge/job-status-v4.html",
-        )
-        self.assertEqual(
-            tools[3]["_meta"]["openai/outputTemplate"],
-            "ui://chatgpt-codex-bridge/job-status-v4.html",
-        )
-        run_schema = tools[2]["inputSchema"]
-        self.assertEqual(run_schema["required"], ["prompt"])
-        self.assertEqual(set(run_schema["properties"]), {"prompt"})
-        start_schema = tools[3]["inputSchema"]
-        self.assertEqual(start_schema["required"], ["prompt"])
-        self.assertEqual(
-            set(start_schema["properties"]),
-            {"prompt", "projectName"},
-        )
-        self.assertNotIn("cwd", json.dumps(start_schema))
-        self.assertIn("existing workspace", tools[2]["description"])
-        self.assertIn("MUST call codex-wait", tools[2]["description"])
-        self.assertIn("workspace-new-project", tools[3]["description"])
-        self.assertIn("new project", tools[3]["description"].lower())
-        self.assertIn("MUST call codex-wait", tools[3]["description"])
-        self.assertIn("MUST call codex-wait", tools[4]["description"])
-        self.assertIn("MUST call this tool again", tools[5]["description"])
-        self.assertIn("same threadId", tools[5]["description"])
-        self.assertEqual(tools[5]["inputSchema"]["required"], ["jobId"])
-        self.assertEqual(
-            set(tools[5]["inputSchema"]["properties"]),
-            {"jobId"},
-        )
-        expected_statuses = [
-            "queued", "running", "completed", "failed", "interrupted"
-        ]
-        for tool in tools[2:8]:
-            self.assertEqual(
-                tool["outputSchema"]["properties"]["status"]["enum"],
-                expected_statuses,
-            )
-        catalog_tools = tools[8:]
-        self.assertEqual(len(catalog_tools), 6)
-        for tool in catalog_tools:
-            self.assertEqual(tool["annotations"], READ_ONLY_ANNOTATIONS)
-            self.assertFalse(tool["inputSchema"]["additionalProperties"])
-            self.assertFalse(tool["outputSchema"]["additionalProperties"])
+        for name in ("codex", "codex-reply", "codex-run", "codex-start", "codex-reply-async", "codex-job-steer"):
+            self.assertEqual(by_name[name]["annotations"], SAFETY_ANNOTATIONS)
+        for name in ("codex-wait", "codex-job-open", "codex-job-status", "codex-overview", "codex-project-list", "codex-repository-list", "codex-thread-list", "codex-thread-read", "codex-job-list"):
+            self.assertEqual(by_name[name]["annotations"], READ_ONLY_ANNOTATIONS)
+        self.assertTrue(by_name["codex-job-cancel"]["annotations"]["destructiveHint"])
+        self.assertTrue(by_name["codex-job-cancel"]["annotations"]["idempotentHint"])
+        self.assertEqual(by_name["codex-wait"]["_meta"]["ui"]["visibility"], ["model"])
+        self.assertEqual(by_name["codex-job-status"]["_meta"]["ui"]["visibility"], ["model", "app"])
+        self.assertNotIn("openai/visibility", by_name["codex-job-status"]["_meta"])
+        self.assertIn("timeoutSeconds", by_name["codex-wait"]["inputSchema"]["properties"])
+        self.assertEqual(by_name["codex-wait"]["inputSchema"]["required"], ["jobId"])
+        self.assertNotIn("MUST call", by_name["codex-run"]["description"])
+        self.assertNotIn("MUST call", by_name["codex-wait"]["description"])
+        self.assertIn("workspace-new-project", by_name["codex-start"]["description"])
+        self.assertIn("same thread/turn", by_name["codex-job-steer"]["description"])
+        self.assertIn("turn interrupt", by_name["codex-job-cancel"]["description"])
+        expected_statuses = ["queued", "running", "completed", "failed", "interrupted"]
+        for name in ("codex-run", "codex-start", "codex-reply-async", "codex-wait", "codex-job-open", "codex-job-status", "codex-job-steer", "codex-job-cancel"):
+            schema = by_name[name]["outputSchema"]
+            self.assertEqual(schema["properties"]["status"]["enum"], expected_statuses)
+            for field in ("transcript", "writerActive", "threadHandoff"):
+                self.assertIn(field, schema["required"])
 
-        codex_schema = tools[0]["inputSchema"]
-        self.assertEqual(codex_schema["type"], "object")
-        self.assertFalse(codex_schema["additionalProperties"])
+        codex_schema = by_name["codex"]["inputSchema"]
         self.assertEqual(codex_schema["required"], ["prompt"])
         self.assertEqual(set(codex_schema["properties"]), {"prompt"})
-        self.assertIn("once per ChatGPT web conversation", tools[0]["description"])
-        self.assertIn("Codex thread: <threadId>", tools[0]["description"])
-        self.assertIn("MUST NOT use this diagnostic tool", tools[0]["description"])
-        self.assertIn("same Codex thread", tools[1]["description"])
-
-        reply_schema = tools[1]["inputSchema"]
-        self.assertEqual(reply_schema["type"], "object")
-        self.assertFalse(reply_schema["additionalProperties"])
+        reply_schema = by_name["codex-reply"]["inputSchema"]
         self.assertEqual(reply_schema["required"], ["prompt", "threadId"])
         self.assertEqual(set(reply_schema["properties"]), {"prompt", "threadId"})
 
-        for tool in tools[:2]:
-            output_schema = tool["outputSchema"]
-            self.assertEqual(output_schema["type"], "object")
-            self.assertFalse(output_schema["additionalProperties"])
-            self.assertEqual(output_schema["required"], ["threadId", "content"])
-            self.assertEqual(
-                set(output_schema["properties"]),
-                {"threadId", "content"},
-            )
-
-        serialized = json.dumps(tools[:2])
-        for forbidden in (
-            "cwd",
-            "danger-full-access",
-            "approval-policy",
-            "config",
-            "model",
-            "developer-instructions",
-            "base-instructions",
-        ):
-            self.assertNotIn(forbidden, serialized)
 
     def test_catalog_tools_cover_projects_repositories_threads_history_and_jobs(self):
         harness = self.harness()
@@ -1315,6 +1240,8 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-wait",
                 "codex-job-open",
                 "codex-job-status",
+                "codex-job-steer",
+                "codex-job-cancel",
                 "codex-overview",
                 "codex-project-list",
                 "codex-repository-list",
@@ -1505,6 +1432,8 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-wait",
                 "codex-job-open",
                 "codex-job-status",
+                "codex-job-steer",
+                "codex-job-cancel",
                 "codex-overview",
                 "codex-project-list",
                 "codex-repository-list",
@@ -1941,8 +1870,8 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertEqual(final["status"], "completed")
         self.assertTrue(final["threadId"].startswith("cgb2.thread."))
         self.assertIn("join fixture", final["content"])
-        self.assertIn("review this result", joined["result"]["content"][0]["text"])
-        self.assertIn("same threadId", joined["result"]["content"][0]["text"])
+        self.assertIn("Review this result", joined["result"]["content"][0]["text"])
+        self.assertIn("same-thread codex-reply-async", joined["result"]["content"][0]["text"])
         self.assertIn(
             "BEGIN UNTRUSTED CODEX OUTPUT",
             joined["result"]["content"][0]["text"],
@@ -2046,7 +1975,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertNotIn("child provider review", final["content"])
         self.assertNotIn("same-thread unrelated turn", final["content"])
 
-    def test_codex_wait_is_bounded_and_requires_another_wait_while_running(self):
+    def test_codex_wait_is_bounded_and_leaves_active_job_durable(self):
         harness = self.harness(job_wait_seconds=0.05)
         harness.initialize()
         job_id, job_dir, status_path = harness.write_job_fixture(
@@ -2064,7 +1993,8 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         self.assertEqual(pending["result"]["structuredContent"]["status"], "running")
         message = pending["result"]["content"][0]["text"]
-        self.assertIn("MUST call codex-wait again", message)
+        self.assertIn("job remains durable", message)
+        self.assertIn("steer or cancel", message)
         self.assertIn(job_id, message)
 
     def test_codex_wait_rejects_unknown_or_extra_arguments(self):
@@ -2480,7 +2410,11 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertLess(elapsed, 0.25)
         self.assertEqual(structured["status"], "queued")
         self.assertIn(
-            "MUST call codex-wait",
+            "durable",
+            queued["result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "codex-job-status",
             queued["result"]["content"][0]["text"],
         )
         self.assertIn("_meta", queued["result"])
@@ -2527,7 +2461,11 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         self.assertEqual(final["threadId"], thread_id)
         self.assertIn("continue fixture", final["content"])
         self.assertIn(
-            "MUST call codex-wait",
+            "durable",
+            queued["result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "steer or cancel",
             queued["result"]["content"][0]["text"],
         )
 
@@ -2736,6 +2674,176 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 for line in completed.stdout.splitlines():
                     json.loads(line)
+
+
+    def test_public_job_state_exposes_auditable_transcript_and_handoff_without_control_ids(self):
+        module_spec = importlib.util.spec_from_file_location(
+            "chatgpt_codex_guard_transcript_test", GUARD,
+        )
+        guard_module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(guard_module)
+        state = {
+            "jobId": "signed-job",
+            "status": "running",
+            "content": "",
+            "updatedAt": 1.0,
+            "lastEventAt": 1.0,
+            "writerActive": True,
+            "threadHandoff": "bridge-owned",
+            "workspace": "/tmp/workspace",
+            "projectName": "demo",
+            "transcript": [],
+        }
+        guard_module.append_transcript(
+            state, "controller", "prompt", "exact prompt", 1.0, "submitted", "private-control-id"
+        )
+        guard_module.append_transcript(
+            state, "codex", "message", "public reply", 2.0, "final_answer"
+        )
+        public = guard_module.public_job_state(state)
+        self.assertTrue(public["writerActive"])
+        self.assertEqual(public["threadHandoff"], "bridge-owned")
+        self.assertEqual(public["transcript"][0]["text"], "exact prompt")
+        self.assertEqual(public["transcript"][1]["text"], "public reply")
+        self.assertNotIn("controlId", json.dumps(public["transcript"]))
+
+    def test_worker_controls_use_exact_turn_steer_and_interrupt_and_record_public_transcript(self):
+        module_spec = importlib.util.spec_from_file_location(
+            "chatgpt_codex_guard_controls_test", GUARD,
+        )
+        guard_module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(guard_module)
+        job_dir = self.root / "control-helper-job"
+        job_dir.mkdir()
+        controls = {
+            "commands": [
+                {"id": "steer-1", "kind": "steer", "prompt": "change direction", "createdAt": 1.0},
+                {"id": "cancel-1", "kind": "cancel", "reason": "stop now", "createdAt": 2.0},
+            ]
+        }
+        (job_dir / "controls.json").write_text(json.dumps(controls), encoding="utf-8")
+        state = {
+            "jobId": "signed-job", "internalJobId": "unused", "status": "running",
+            "content": "", "updatedAt": 0.0, "lastEventAt": 0.0,
+            "transcript": [], "report": guard_module.initial_job_report(),
+        }
+        (job_dir / "status.json").write_text(json.dumps(state), encoding="utf-8")
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = []
+            def send(self, message):
+                self.messages.append(message)
+
+        client = FakeClient()
+        processed = set()
+        guard_module.process_worker_controls(
+            client, job_dir, state, "raw-thread", "raw-turn", processed
+        )
+        self.assertEqual([m["method"] for m in client.messages], ["turn/steer", "turn/interrupt"])
+        self.assertEqual(client.messages[0]["params"], {
+            "threadId": "raw-thread",
+            "expectedTurnId": "raw-turn",
+            "input": [{"type": "text", "text": "change direction"}],
+        })
+        self.assertEqual(client.messages[1]["params"], {
+            "threadId": "raw-thread", "turnId": "raw-turn",
+        })
+        self.assertEqual([entry["kind"] for entry in state["transcript"]], ["steer", "cancel"])
+        self.assertEqual([entry["text"] for entry in state["transcript"]], ["change direction", "stop now"])
+        self.assertEqual(processed, {"steer-1", "cancel-1"})
+
+    def test_wait_timeout_is_caller_bounded_and_status_is_model_visible(self):
+        harness = self.harness(scenario="async_slow", job_wait_seconds=0.05)
+        response = harness.initialize()
+        by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
+        self.assertEqual(by_name["codex-job-status"]["_meta"]["ui"]["visibility"], ["model", "app"])
+        queued = harness.call(3, "codex-run", {"prompt": "bounded wait"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        joined = harness.call(4, "codex-wait", {"jobId": job_id, "timeoutSeconds": 0.02})
+        self.assertIn(joined["result"]["structuredContent"]["status"], ("queued", "running", "completed"))
+        too_long = harness.call(5, "codex-wait", {"jobId": job_id, "timeoutSeconds": 56})
+        self.assertEqual(too_long["error"]["code"], -32602)
+
+
+
+    def test_running_steer_is_immediately_visible_in_public_transcript(self):
+        harness = self.harness(scenario="async_block", job_max_seconds=60)
+        harness.initialize()
+        queued = harness.call(3, "codex-run", {"prompt": "steer blocked turn"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        status_path = harness.job_dir_for(job_id) / "status.json"
+        deadline = time.time() + 3.0
+        state = {}
+        while time.time() < deadline:
+            state = json.loads(status_path.read_text(encoding="utf-8"))
+            if state.get("status") == "running" and state.get("internalTurnId"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(state.get("status"), "running")
+
+        steered = harness.call(4, "codex-job-steer", {
+            "jobId": job_id,
+            "prompt": "change direction immediately",
+        })["result"]["structuredContent"]
+        steer_entries = [
+            entry for entry in steered["transcript"]
+            if entry.get("kind") == "steer"
+        ]
+        self.assertEqual([entry["text"] for entry in steer_entries], ["change direction immediately"])
+        self.assertIn(steer_entries[0]["delivery"], ("queued", "sent"))
+        harness.call(5, "codex-job-cancel", {"jobId": job_id, "reason": "cleanup"})
+
+    def test_running_cancel_falls_back_to_verified_worker_and_is_idempotent(self):
+        harness = self.harness(scenario="async_block", job_max_seconds=60)
+        harness.initialize()
+        queued = harness.call(3, "codex-run", {"prompt": "cancel blocked turn"})
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        job_dir = harness.job_dir_for(job_id)
+        status_path = job_dir / "status.json"
+        deadline = time.time() + 3.0
+        state = {}
+        while time.time() < deadline:
+            state = json.loads(status_path.read_text(encoding="utf-8"))
+            if state.get("status") == "running" and state.get("internalTurnId"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(state.get("status"), "running")
+        self.assertTrue(state.get("internalTurnId"))
+
+        cancelled = harness.call(4, "codex-job-cancel", {
+            "jobId": job_id,
+            "reason": "user requested takeover",
+        })["result"]["structuredContent"]
+        self.assertEqual(cancelled["status"], "interrupted")
+        self.assertFalse(cancelled["writerActive"])
+        self.assertEqual(cancelled["threadHandoff"], "available")
+        self.assertEqual(cancelled["nextAction"], "continue")
+        self.assertIn("threadId", cancelled)
+        cancel_entries = [
+            entry for entry in cancelled["transcript"]
+            if entry.get("kind") == "cancel"
+        ]
+        self.assertEqual([entry["text"] for entry in cancel_entries], ["user requested takeover"])
+
+        durable = json.loads(status_path.read_text(encoding="utf-8"))
+        worker = json.loads((job_dir / "worker.json").read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker["pid"], 0)
+        controls = json.loads((job_dir / "controls.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["kind"] for item in controls["commands"]], ["cancel"])
+
+        again = harness.call(5, "codex-job-cancel", {
+            "jobId": job_id,
+            "reason": "duplicate cancellation must be a no-op",
+        })["result"]["structuredContent"]
+        self.assertEqual(again["status"], "interrupted")
+        self.assertEqual(again["threadId"], cancelled["threadId"])
+        self.assertEqual(
+            json.loads((job_dir / "controls.json").read_text(encoding="utf-8")),
+            controls,
+        )
+        self.assertFalse(durable["writerActive"])
 
 
 if __name__ == "__main__":

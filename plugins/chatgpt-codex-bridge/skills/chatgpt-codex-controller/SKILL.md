@@ -64,9 +64,10 @@ does not grant access to another person's computer. Treat setup as per device.
 ## Control one durable Codex thread
 
 - When the task targets the bridge's existing workspace or an existing
-  repository under it, MUST call `codex-run(prompt)`. It returns a durable job
-  immediately; call `codex-wait(jobId)` next and keep calling it while the
-  status is `queued` or `running`.
+  repository under it, use `codex-run(prompt)`. It returns a durable job
+  immediately. Use `codex-wait(jobId, timeoutSeconds?)` when foreground joining
+  is useful, or `codex-job-status(jobId)` for an immediate transcript/status
+  snapshot. The job remains recoverable if you return control to the user.
 - When the user asks to build a new project, MUST call
   `codex-start(prompt, projectName)` and provide a concise display name, never a
   filesystem path. The bridge creates a separate directory, registers it as a
@@ -74,10 +75,19 @@ does not grant access to another person's computer. Treat setup as per device.
   directory as `cwd`, and passes the real `workspace-new-project` Skill as an
   explicit first-turn input. The first task is accepted only after its durable
   project/thread mapping has been verified.
-  The call returns a durable job immediately. MUST call
-  `codex-wait(jobId)` next and keep calling it with the same job ID while the
-  status is `queued` or `running`; do not answer the user merely because the
-  job was submitted.
+  The call returns a durable job immediately. Join it with `codex-wait` when
+  useful, inspect it with `codex-job-status`, and preserve the job ID for later
+  recovery.
+- While a job is active, use `codex-job-steer(jobId, prompt)` to add or
+  correct instructions inside the exact active turn. Use
+  `codex-job-cancel(jobId, reason?)` to stop only that job. Cancellation is
+  idempotent and releases the bridge writer before advertising Desktop handoff.
+- `codex-job-status` exposes the public controller/Codex transcript. Use
+  `codex-thread-read` for persisted turn history and command/file activity when
+  the user wants to inspect the concrete conversation. Private reasoning is not
+  exposed. `writerActive=true` / `threadHandoff=bridge-owned` means Codex Desktop
+  must not become a second writer; `threadHandoff=available` means the bridge
+  has released the writer and the thread can be taken over from Codex Desktop.
 - When `codex-wait` returns `completed`, review its Codex result against the
   user's full requested outcome. If work remains, call
   `codex-reply-async(prompt, threadId)` with the exact returned thread ID, then
@@ -115,8 +125,10 @@ does not grant access to another person's computer. Treat setup as per device.
   The current directory is already the final project root, so it MUST NOT create
   a nested directory. Do not treat the start as successful unless the Skill's
   spec/ADR/project-memory scaffold exists.
-- Stop issuing MCP calls only when the requested work and verification are
-  complete, material user input is required, or a real terminal blocker exists.
+- Continuous foreground polling is a controller choice, not a bridge
+  invariant. Stop polling when the user needs control, another foreground action
+  is more useful, or the durable job can be resumed later. Do not claim
+  unsolicited delivery while ChatGPT is inactive.
 
 ## Operate or remove
 

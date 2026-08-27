@@ -49,3 +49,8 @@ thread on a trusted single-user macOS or Windows device.
 - If the browser page is closed, reopen the same conversation and let the card
   resume polling; then use the explicit return control.
 - If the job is `queued` or `running`, join again with `codex-wait(jobId)`.
+
+
+## Live control and handoff
+
+Use `codex-job-status` for an immediate public transcript and lifecycle snapshot. Use `codex-job-steer` to add instructions to an active turn and `codex-job-cancel` to stop only that durable job. `codex-wait` is a bounded join, not a requirement to monopolize the foreground. Never create a second writer for a bridge-owned thread; wait for `threadHandoff=available` before telling the user the thread is ready for writable Codex Desktop takeover.
