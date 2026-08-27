@@ -1,0 +1,36 @@
+name: Apply control transcript overlay
+
+on:
+  push:
+    branches:
+      - feat/job-control-transcript-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[transcript-overlay-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/job-control-transcript-handoff
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply pending-control transcript overlay
+        run: python3 scripts/dev/apply_control_transcript_overlay.py
+      - name: Validate full guard contract
+        run: |
+          python3 -m py_compile scripts/bridge/codex-mcp-guard.py
+          cmp scripts/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/bridge/codex-mcp-guard.py
+          git diff --check
+          python3 -m unittest tests.bridge.test-codex-mcp-guard
+      - name: Commit validated overlay
+        run: |
+          git config user.name 'chatgpt-controller'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/bridge/codex-mcp-guard.py tests/bridge/test-codex-mcp-guard.py docs/specs/job-control-transcript-handoff/design.md
+          git commit -m 'fix: expose pending controls in job transcript [transcript-overlay-applied]'
+          git push origin HEAD:feat/job-control-transcript-handoff
