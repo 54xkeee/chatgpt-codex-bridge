@@ -45,6 +45,8 @@ LEGACY_WIDGET_URIS = (
 PUBLIC_RESULT_LIMIT = 60_000
 STORED_RESULT_LIMIT = 500_000
 PROJECT_NAME_MAX_CHARS = 120
+MODEL_NAME_MAX_CHARS = 200
+REASONING_EFFORT_MAX_CHARS = 100
 PROJECT_STEM_MAX_BYTES = 180
 PROJECT_COLLISION_LIMIT = 10_000
 JOB_WAIT_DEFAULT_SECONDS = 52.0
@@ -167,6 +169,12 @@ ASYNC_OUTPUT_SCHEMA = {
             "enum": ["pending", "bridge-owned", "available", "unavailable"],
         },
         "projectName": {"type": "string"},
+        "requestedModel": {"type": ["string", "null"]},
+        "requestedReasoningEffort": {"type": ["string", "null"]},
+        "observedModel": {"type": ["string", "null"]},
+        "observedReasoningEffort": {"type": ["string", "null"]},
+        "observationSource": {"type": ["string", "null"]},
+        "observationPath": {"type": ["string", "null"]},
     },
     "required": [
         "jobId", "status", "content", "contentTruncated", "updatedAt",
@@ -185,6 +193,16 @@ PAGE_INPUT_PROPERTIES = {
     "cursor": {"type": "string"},
 }
 CATALOG_OUTPUT_SCHEMAS = {
+    "codex-model-list": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "models": {"type": "array", "items": {"type": "object"}},
+            "defaultModel": {"type": "string"},
+            "nextCursor": {"type": ["string", "null"]},
+        },
+        "required": ["models", "defaultModel", "nextCursor"],
+    },
     "codex-overview": {
         "type": "object",
         "additionalProperties": False,
@@ -486,6 +504,45 @@ def async_tool_meta(visibility):
     }
 
 
+def async_model_properties():
+    return {
+        "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MODEL_NAME_MAX_CHARS,
+            "description": (
+                "Canonical Codex model ID returned by codex-model-list. "
+                "Omit to preserve the local Codex default behavior."
+            ),
+        },
+        "reasoningEffort": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": REASONING_EFFORT_MAX_CHARS,
+            "description": (
+                "Reasoning effort advertised for the selected model by "
+                "codex-model-list. Omit to preserve the model's default behavior."
+            ),
+        },
+    }
+
+
+def valid_async_model_options(arguments):
+    for key, maximum in (
+        ("model", MODEL_NAME_MAX_CHARS),
+        ("reasoningEffort", REASONING_EFFORT_MAX_CHARS),
+    ):
+        value = arguments.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or value != value.strip()
+            or not value
+            or len(value) > maximum
+        ):
+            return False
+    return True
+
+
 def build_public_tools(sandbox, approval_policy):
     policy_description = SUPPORTED_POLICIES[(sandbox, approval_policy)]
     tools = [
@@ -565,6 +622,7 @@ def build_public_tools(sandbox, approval_policy):
                 "additionalProperties": False,
                 "properties": {
                     "prompt": {"type": "string", "description": "Complete Codex task brief."},
+                    **async_model_properties(),
                 },
                 "required": ["prompt"],
             },
@@ -598,6 +656,7 @@ def build_public_tools(sandbox, approval_policy):
                             "not a path; the bridge creates the directory locally."
                         ),
                     },
+                    **async_model_properties(),
                 },
                 "required": ["prompt"],
             },
@@ -621,6 +680,7 @@ def build_public_tools(sandbox, approval_policy):
                 "properties": {
                     "prompt": {"type": "string"},
                     "threadId": {"type": "string"},
+                    **async_model_properties(),
                 },
                 "required": ["prompt", "threadId"],
             },
@@ -749,6 +809,21 @@ def build_public_tools(sandbox, approval_policy):
     ])
     tools.extend([
         {
+            "name": "codex-model-list",
+            "title": "List Codex Models",
+            "description": (
+                "Read the current Codex App Server model catalog, including the "
+                "canonical default and each model's supported/default reasoning effort."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": dict(PAGE_INPUT_PROPERTIES),
+            },
+            "outputSchema": CATALOG_OUTPUT_SCHEMAS["codex-model-list"],
+            "annotations": READ_ONLY_ANNOTATIONS,
+        },
+        {
             "name": "codex-overview",
             "title": "Inspect Codex Overview",
             "description": (
@@ -870,6 +945,7 @@ class CapabilityCodec:
         "threads-cursor",
         "items-cursor",
         "jobs-cursor",
+        "models-cursor",
     })
 
     def __init__(self, key_path, context=""):
@@ -1722,6 +1798,16 @@ def public_job_state(state):
     )
     if isinstance(state.get("projectName"), str):
         public["projectName"] = state["projectName"]
+    for field in (
+        "requestedModel",
+        "requestedReasoningEffort",
+        "observedModel",
+        "observedReasoningEffort",
+        "observationSource",
+        "observationPath",
+    ):
+        value = state.get(field)
+        public[field] = value if isinstance(value, str) and value else None
     thread_id = state.get("threadId")
     if isinstance(thread_id, str) and thread_id:
         public["threadId"] = thread_id
@@ -2145,9 +2231,17 @@ class JobStore:
         project_name=None,
         existing_workspace=False,
         thread_workspace=None,
+        model_metadata=None,
     ):
         if not isinstance(prompt, str) or len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
             raise GuardAdmissionError("prompt exceeds byte limit")
+        if not isinstance(model_metadata, dict):
+            model_metadata = {
+                "requestedModel": None,
+                "requestedReasoningEffort": None,
+                "wireModel": None,
+                "wireReasoningEffort": None,
+            }
         with self._locked_admission():
             job_directories = self._job_directories()
             states = [self._state_for_path(path) for path in job_directories]
@@ -2218,6 +2312,12 @@ class JobStore:
                 "existingWorkspace": existing_workspace,
                 "projectName": display_name,
                 "projectId": project_id,
+                "model": model_metadata["wireModel"],
+                "reasoningEffort": model_metadata["wireReasoningEffort"],
+                "requestedModel": model_metadata["requestedModel"],
+                "requestedReasoningEffort": model_metadata[
+                    "requestedReasoningEffort"
+                ],
                 "createdAt": created_at,
             }
             state = {
@@ -2232,6 +2332,14 @@ class JobStore:
                 "threadId": thread_id or "",
                 "internalThreadId": internal_thread_id,
                 "projectId": project_id,
+                "requestedModel": model_metadata["requestedModel"],
+                "requestedReasoningEffort": model_metadata[
+                    "requestedReasoningEffort"
+                ],
+                "observedModel": None,
+                "observedReasoningEffort": None,
+                "observationSource": None,
+                "observationPath": None,
                 "content": allocation_error or "任务已进入本机 Codex 后台队列。",
                 "contentTruncated": False,
                 "phase": "failed" if allocation_error else "queued",
@@ -2745,6 +2853,156 @@ def paginate_catalog(codec, audience, entries, limit, cursor):
         else None
     )
     return page, next_cursor
+
+
+def canonical_model(model):
+    if not isinstance(model, dict):
+        raise GuardProtocolError("invalid Codex model catalog")
+    required = {
+        "id": str,
+        "model": str,
+        "displayName": str,
+        "description": str,
+        "isDefault": bool,
+        "hidden": bool,
+        "defaultReasoningEffort": str,
+        "supportedReasoningEfforts": list,
+    }
+    for key, expected_type in required.items():
+        value = model.get(key)
+        if not isinstance(value, expected_type) or (
+            expected_type is str and not value
+        ):
+            raise GuardProtocolError("invalid Codex model catalog")
+    efforts = []
+    for option in model["supportedReasoningEfforts"]:
+        if not isinstance(option, dict):
+            raise GuardProtocolError("invalid Codex model catalog")
+        effort = option.get("reasoningEffort")
+        description = option.get("description")
+        if (
+            not isinstance(effort, str)
+            or not effort
+            or effort in {item["reasoningEffort"] for item in efforts}
+            or not isinstance(description, str)
+        ):
+            raise GuardProtocolError("invalid Codex model catalog")
+        efforts.append({
+            "reasoningEffort": effort,
+            "description": description,
+        })
+    if model["defaultReasoningEffort"] not in {
+        item["reasoningEffort"] for item in efforts
+    }:
+        raise GuardProtocolError("invalid Codex model catalog")
+    return {
+        "id": model["id"],
+        "model": model["model"],
+        "displayName": model["displayName"],
+        "description": model["description"],
+        "isDefault": model["isDefault"],
+        "hidden": model["hidden"],
+        "supportedReasoningEfforts": efforts,
+        "defaultReasoningEffort": model["defaultReasoningEffort"],
+    }
+
+
+class CodexModelCatalog:
+    def __init__(self, codex_bin, capabilities):
+        self.codex_bin = codex_bin
+        self.capabilities = capabilities
+
+    def all(self):
+        client = AppServerClient(
+            self.codex_bin,
+            lambda _message: None,
+            time.monotonic() + CATALOG_DEADLINE_SECONDS,
+        )
+        try:
+            client.request(1, "initialize", {
+                "clientInfo": {
+                    "name": APP_SERVER_CLIENT_NAME,
+                    "title": APP_SERVER_CLIENT_TITLE,
+                    "version": APP_SERVER_CLIENT_VERSION,
+                },
+                "capabilities": {"experimentalApi": True},
+            })
+            client.notify("initialized", {})
+            models = []
+            cursor = None
+            seen = set()
+            request_id = 2
+            while True:
+                params = {"limit": CATALOG_MAX_LIMIT, "includeHidden": False}
+                if cursor:
+                    params["cursor"] = cursor
+                result = client.request(request_id, "model/list", params)
+                request_id += 1
+                data = result.get("data") if isinstance(result, dict) else None
+                next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
+                if not isinstance(data, list) or (
+                    next_cursor is not None and not isinstance(next_cursor, str)
+                ):
+                    raise GuardProtocolError("invalid Codex model catalog")
+                models.extend(canonical_model(item) for item in data)
+                if next_cursor is None:
+                    break
+                if not next_cursor or next_cursor in seen:
+                    raise GuardProtocolError("invalid Codex model cursor")
+                seen.add(next_cursor)
+                if len(seen) > CATALOG_MAX_ROOTS:
+                    raise GuardProtocolError("Codex model catalog exceeds page limit")
+                cursor = next_cursor
+            defaults = [model for model in models if model["isDefault"]]
+            if len(defaults) != 1:
+                raise GuardProtocolError("Codex model catalog has no unique default")
+            return models, defaults[0]
+        finally:
+            client.close()
+
+    def page(self, arguments):
+        models, default = self.all()
+        page, next_cursor = paginate_catalog(
+            self.capabilities,
+            "models-cursor",
+            models,
+            catalog_page_limit(arguments),
+            arguments.get("cursor"),
+        )
+        return {
+            "models": page,
+            "defaultModel": default["id"],
+            "nextCursor": next_cursor,
+        }
+
+    def resolve(self, requested_model, requested_effort):
+        if requested_model is None and requested_effort is None:
+            return {
+                "requestedModel": None,
+                "requestedReasoningEffort": None,
+                "wireModel": None,
+                "wireReasoningEffort": None,
+            }
+        models, default = self.all()
+        selected = default if requested_model is None else next(
+            (model for model in models if model["id"] == requested_model), None
+        )
+        if selected is None:
+            raise GuardAdmissionError("unsupported Codex model")
+        supported = {
+            option["reasoningEffort"]
+            for option in selected["supportedReasoningEfforts"]
+        }
+        if requested_effort is not None and requested_effort not in supported:
+            raise GuardAdmissionError(
+                "unsupported reasoning effort for Codex model"
+            )
+        return {
+            "requestedModel": requested_model,
+            "requestedReasoningEffort": requested_effort,
+            "wireModel": selected["model"] if requested_model is not None else None,
+            "wireReasoningEffort": requested_effort,
+        }
 
 
 def git_repository_probe(path):
@@ -3280,6 +3538,50 @@ def register_desktop_project(workspace, desktop_open_bin):
         raise GuardProtocolError("Codex desktop project registration failed")
 
 
+def observe_turn_context(thread_result, turn_id):
+    thread = thread_result.get("thread") if isinstance(thread_result, dict) else None
+    raw_path = thread.get("path") if isinstance(thread, dict) else None
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(turn_id, str):
+        return None
+    try:
+        session_path = Path(raw_path).resolve(strict=True)
+        codex_home = Path(
+            os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+        ).resolve(strict=True)
+        sessions_root = (codex_home / "sessions").resolve(strict=True)
+        if (
+            os.path.commonpath((str(session_path), str(sessions_root)))
+            != str(sessions_root)
+            or not session_path.is_file()
+        ):
+            return None
+        with session_path.open("r", encoding="utf-8", errors="strict") as stream:
+            for line in stream:
+                if len(line.encode("utf-8")) > MAX_LINE_BYTES:
+                    return None
+                if '"turn_context"' not in line or turn_id not in line:
+                    continue
+                record = json.loads(line)
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if (
+                    record.get("type") != "turn_context"
+                    or not isinstance(payload, dict)
+                    or payload.get("turn_id") != turn_id
+                    or not isinstance(payload.get("model"), str)
+                    or not isinstance(payload.get("effort"), str)
+                ):
+                    continue
+                return {
+                    "observedModel": payload["model"],
+                    "observedReasoningEffort": payload["effort"],
+                    "observationSource": "session-turn-context",
+                    "observationPath": str(session_path),
+                }
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeError):
+        return None
+    return None
+
+
 def run_job(
     job_dir,
     workspace,
@@ -3314,6 +3616,8 @@ def run_job(
     existing_workspace = request.get("existingWorkspace", False)
     project_name = request.get("projectName", "")
     project_id = request.get("projectId", "")
+    model = request.get("model")
+    reasoning_effort = request.get("reasoningEffort")
     if not isinstance(prompt, str) or not prompt:
         return EXIT_CONFIG
     if not isinstance(requested_thread, str) or not isinstance(
@@ -3331,6 +3635,8 @@ def run_job(
         or not isinstance(existing_workspace, bool)
         or not isinstance(project_name, str)
         or not isinstance(project_id, str)
+        or (model is not None and not isinstance(model, str))
+        or (reasoning_effort is not None and not isinstance(reasoning_effort, str))
         or (existing_workspace and (bootstrap_required or bool(requested_thread)))
     ):
         return EXIT_CONFIG
@@ -3515,27 +3821,36 @@ def run_job(
         })
         atomic_write_json(path / "status.json", state)
         if requested_internal_thread:
+            thread_params = {
+                "threadId": requested_internal_thread,
+                "cwd": workspace,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }
+            if model is not None:
+                thread_params["model"] = model
             thread_result = client.request(
                 2,
                 "thread/resume",
-                {
-                    "threadId": requested_internal_thread,
-                    "cwd": workspace,
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access",
-                },
+                thread_params,
             )
             next_request_id = 3
         elif existing_workspace:
+            thread_params = {
+                "cwd": workspace,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "serviceName": APP_SERVER_CLIENT_NAME,
+            }
+            if model is not None:
+                thread_params.update({
+                    "model": model,
+                    "allowProviderModelFallback": False,
+                })
             thread_result = client.request(
                 2,
                 "thread/start",
-                {
-                    "cwd": workspace,
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access",
-                    "serviceName": APP_SERVER_CLIENT_NAME,
-                },
+                thread_params,
             )
             next_request_id = 3
         else:
@@ -3582,6 +3897,11 @@ def run_job(
             }
             if project_id:
                 thread_params["projectId"] = project_id
+            if model is not None:
+                thread_params.update({
+                    "model": model,
+                    "allowProviderModelFallback": False,
+                })
             thread_result = client.request(
                 3,
                 "thread/start",
@@ -3636,16 +3956,21 @@ def run_job(
             "updatedAt": stage_time,
         })
         atomic_write_json(path / "status.json", state)
+        turn_params = {
+            "threadId": thread_id,
+            "input": turn_input,
+            "cwd": workspace,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }
+        if model is not None:
+            turn_params["model"] = model
+        if reasoning_effort is not None:
+            turn_params["effort"] = reasoning_effort
         turn_result = client.request(
             next_request_id,
             "turn/start",
-            {
-                "threadId": thread_id,
-                "input": turn_input,
-                "cwd": workspace,
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type": "dangerFullAccess"},
-            },
+            turn_params,
         )
         next_request_id += 1
         turn = turn_result.get("turn")
@@ -3673,6 +3998,12 @@ def run_job(
             if "id" in message and "method" not in message:
                 continue
             record_event(message)
+
+        observation = observe_turn_context(thread_result, expected_turn_id)
+        if observation is not None:
+            state.update(observation)
+            state["updatedAt"] = time.time()
+            atomic_write_json(path / "status.json", state)
 
         # A newly started App Server thread is not durable/listable until its
         # first turn has been written. Verify the project-thread relationship
@@ -3887,6 +4218,9 @@ class CodexMcpGuard:
             self.job_store.capabilities,
             self.job_store,
         )
+        self.model_catalog = CodexModelCatalog(
+            codex_bin, self.job_store.capabilities
+        )
         self.child = None
         self.initialize_result = None
         self.initialize_in_flight = False
@@ -4094,18 +4428,30 @@ class CodexMcpGuard:
             return
         if name == "codex-run":
             if (
-                set(arguments) != {"prompt"}
+                "prompt" not in arguments
+                or set(arguments) - {"prompt", "model", "reasoningEffort"}
                 or not isinstance(arguments.get("prompt"), str)
                 or len(arguments["prompt"].encode("utf-8")) > PROMPT_MAX_BYTES
+                or not valid_async_model_options(arguments)
             ):
                 self.invalid_params(request_id)
                 return
             try:
+                model_metadata = self.model_catalog.resolve(
+                    arguments.get("model"), arguments.get("reasoningEffort")
+                )
                 state = self.job_store.enqueue(
-                    arguments["prompt"], existing_workspace=True
+                    arguments["prompt"],
+                    existing_workspace=True,
+                    model_metadata=model_metadata,
                 )
             except GuardAdmissionError as error:
                 self.emit(jsonrpc_error(request_id, -32010, str(error)))
+                return
+            except (GuardProtocolError, OSError, JobDeadlineExceeded):
+                self.emit(jsonrpc_error(
+                    request_id, -32020, "Codex model catalog unavailable"
+                ))
                 return
             self.emit(
                 job_tool_result(
@@ -4116,9 +4462,12 @@ class CodexMcpGuard:
         if name == "codex-start":
             if (
                 "prompt" not in arguments
-                or set(arguments) - {"prompt", "projectName"}
+                or set(arguments) - {
+                    "prompt", "projectName", "model", "reasoningEffort"
+                }
                 or not isinstance(arguments.get("prompt"), str)
                 or len(arguments["prompt"].encode("utf-8")) > PROMPT_MAX_BYTES
+                or not valid_async_model_options(arguments)
             ):
                 self.invalid_params(request_id)
                 return
@@ -4134,11 +4483,21 @@ class CodexMcpGuard:
                 self.invalid_params(request_id)
                 return
             try:
+                model_metadata = self.model_catalog.resolve(
+                    arguments.get("model"), arguments.get("reasoningEffort")
+                )
                 state = self.job_store.enqueue(
-                    arguments["prompt"], project_name=project_name
+                    arguments["prompt"],
+                    project_name=project_name,
+                    model_metadata=model_metadata,
                 )
             except GuardAdmissionError as error:
                 self.emit(jsonrpc_error(request_id, -32010, str(error)))
+                return
+            except (GuardProtocolError, OSError, JobDeadlineExceeded):
+                self.emit(jsonrpc_error(
+                    request_id, -32020, "Codex model catalog unavailable"
+                ))
                 return
             self.emit(
                 job_tool_result(
@@ -4147,7 +4506,14 @@ class CodexMcpGuard:
             )
             return
         if name == "codex-reply-async":
-            if set(arguments) != {"prompt", "threadId"}:
+            if (
+                "prompt" not in arguments
+                or "threadId" not in arguments
+                or set(arguments) - {
+                    "prompt", "threadId", "model", "reasoningEffort"
+                }
+                or not valid_async_model_options(arguments)
+            ):
                 self.invalid_params(request_id)
                 return
             prompt = arguments.get("prompt")
@@ -4161,7 +4527,23 @@ class CodexMcpGuard:
                 self.invalid_params(request_id)
                 return
             try:
-                state = self.job_store.enqueue(prompt, thread_id=thread_id)
+                model_metadata = self.model_catalog.resolve(
+                    arguments.get("model"), arguments.get("reasoningEffort")
+                )
+            except GuardAdmissionError as error:
+                self.emit(jsonrpc_error(request_id, -32010, str(error)))
+                return
+            except (GuardProtocolError, OSError, JobDeadlineExceeded):
+                self.emit(jsonrpc_error(
+                    request_id, -32020, "Codex model catalog unavailable"
+                ))
+                return
+            try:
+                state = self.job_store.enqueue(
+                    prompt,
+                    thread_id=thread_id,
+                    model_metadata=model_metadata,
+                )
             except GuardProtocolError:
                 try:
                     thread_workspace = self.catalog.resolve_thread_workspace(thread_id)
@@ -4169,6 +4551,7 @@ class CodexMcpGuard:
                         prompt,
                         thread_id=thread_id,
                         thread_workspace=thread_workspace,
+                        model_metadata=model_metadata,
                     )
                 except GuardAdmissionError as error:
                     self.emit(jsonrpc_error(request_id, -32010, str(error)))
@@ -4255,6 +4638,7 @@ class CodexMcpGuard:
             self.emit(jsonrpc_error(request_id, -32601, "Unknown tool"))
             return
         allowed = {
+            "codex-model-list": {"limit", "cursor"},
             "codex-overview": set(),
             "codex-project-list": {"limit", "cursor"},
             "codex-repository-list": {"limit", "cursor"},
@@ -4269,7 +4653,9 @@ class CodexMcpGuard:
             self.invalid_params(request_id)
             return
         try:
-            if name == "codex-overview":
+            if name == "codex-model-list":
+                payload = self.model_catalog.page(arguments)
+            elif name == "codex-overview":
                 payload = self.catalog.overview()
             elif name == "codex-project-list":
                 payload = self.catalog.project_list(arguments)
@@ -4507,6 +4893,7 @@ class CodexMcpGuard:
                 "codex-thread-list",
                 "codex-thread-read",
                 "codex-job-list",
+                "codex-model-list",
             ):
                 self.handle_catalog_call(message, params)
             else:

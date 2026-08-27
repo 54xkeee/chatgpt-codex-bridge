@@ -96,6 +96,20 @@ Default async limits are 256 KiB per prompt, two active jobs, 512 retained job
 records, and four hours per App Server worker. Limit failures are MCP admission
 errors and do not allocate a project or worker.
 
+## Model selection
+
+`codex-model-list(limit?, cursor?)` is read-only and returns the current App
+Server catalog, canonical default model, and per-model supported/default
+reasoning efforts. Its cursor uses the existing signed, installation-scoped
+catalog capability format.
+
+`codex-run`, `codex-start`, and `codex-reply-async` accept optional `model` and
+`reasoningEffort`. Explicit values are validated against live `model/list`
+before allocation and sent through canonical `thread/start|resume` and
+`turn/start`. Unsupported combinations fail closed; omitted values preserve the
+previous payload. Public job state separates requested values from actual model
+and effort observed in the exact rollout `turn_context`.
+
 
 ## Scoped job controls
 

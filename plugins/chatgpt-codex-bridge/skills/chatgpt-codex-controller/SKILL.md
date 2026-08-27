@@ -139,3 +139,13 @@ does not grant access to another person's computer. Treat setup as per device.
 
 The current package supports macOS LaunchAgents and a Windows current-user
 Startup service. Linux systemd installation is outside this package.
+
+## Select a durable model
+
+- Call `codex-model-list` to read current canonical model IDs and each model's
+  supported/default reasoning efforts.
+- `codex-run`, `codex-start`, and `codex-reply-async` accept optional `model`
+  and `reasoningEffort`. Unsupported combinations fail before job allocation.
+- Omit both fields to preserve existing Codex defaults. Job status reports
+  requested values separately from actual values observed in rollout
+  `turn_context`.

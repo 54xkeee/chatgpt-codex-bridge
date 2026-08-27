@@ -173,6 +173,33 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
     project_id = ""
     project_name = ""
     project_roots = []
+    models = [
+        {
+            "id": "gpt-test-default",
+            "model": "gpt-test-default",
+            "displayName": "GPT Test Default",
+            "description": "fixture default",
+            "isDefault": True,
+            "hidden": False,
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "medium", "description": "fixture"},
+            ],
+            "defaultReasoningEffort": "medium",
+        },
+        {
+            "id": "gpt-5.6-luna",
+            "model": "gpt-5.6-luna",
+            "displayName": "GPT-5.6-Luna",
+            "description": "fixture luna",
+            "isDefault": False,
+            "hidden": False,
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "fixture"},
+                {"reasoningEffort": "max", "description": "fixture"},
+            ],
+            "defaultReasoningEffort": "low",
+        },
+    ]
 
     catalog_workspace = os.path.join(os.path.dirname(__file__), "workspace")
     catalog_repository = os.path.join(catalog_workspace, "repo-alpha")
@@ -270,6 +297,14 @@ if len(sys.argv) >= 2 and sys.argv[1] == "app-server":
             })
         elif method == "initialized":
             pass
+        elif method == "model/list":
+            if SCENARIO == "model_catalog_invalid":
+                emit({"id": message["id"], "result": {"data": [{}]}})
+                continue
+            emit({
+                "id": message["id"],
+                "result": {"data": models, "nextCursor": None},
+            })
         elif method == "project/create":
             if SCENARIO == "async_project_api_missing":
                 emit({
@@ -999,14 +1034,14 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex", "codex-reply", "codex-run", "codex-start",
                 "codex-reply-async", "codex-wait", "codex-job-open",
                 "codex-job-status", "codex-job-steer", "codex-job-cancel",
-                "codex-overview", "codex-project-list",
+                "codex-model-list", "codex-overview", "codex-project-list",
                 "codex-repository-list", "codex-thread-list",
                 "codex-thread-read", "codex-job-list",
             ],
         )
         for name in ("codex", "codex-reply", "codex-run", "codex-start", "codex-reply-async", "codex-job-steer"):
             self.assertEqual(by_name[name]["annotations"], SAFETY_ANNOTATIONS)
-        for name in ("codex-wait", "codex-job-open", "codex-job-status", "codex-overview", "codex-project-list", "codex-repository-list", "codex-thread-list", "codex-thread-read", "codex-job-list"):
+        for name in ("codex-wait", "codex-job-open", "codex-job-status", "codex-model-list", "codex-overview", "codex-project-list", "codex-repository-list", "codex-thread-list", "codex-thread-read", "codex-job-list"):
             self.assertEqual(by_name[name]["annotations"], READ_ONLY_ANNOTATIONS)
         self.assertTrue(by_name["codex-job-cancel"]["annotations"]["destructiveHint"])
         self.assertTrue(by_name["codex-job-cancel"]["annotations"]["idempotentHint"])
@@ -1033,6 +1068,18 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         reply_schema = by_name["codex-reply"]["inputSchema"]
         self.assertEqual(reply_schema["required"], ["prompt", "threadId"])
         self.assertEqual(set(reply_schema["properties"]), {"prompt", "threadId"})
+        self.assertEqual(
+            set(by_name["codex-run"]["inputSchema"]["properties"]),
+            {"prompt", "model", "reasoningEffort"},
+        )
+        self.assertEqual(
+            set(by_name["codex-start"]["inputSchema"]["properties"]),
+            {"prompt", "projectName", "model", "reasoningEffort"},
+        )
+        self.assertEqual(
+            set(by_name["codex-reply-async"]["inputSchema"]["properties"]),
+            {"prompt", "threadId", "model", "reasoningEffort"},
+        )
 
 
     def test_catalog_tools_cover_projects_repositories_threads_history_and_jobs(self):
@@ -1242,6 +1289,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-job-status",
                 "codex-job-steer",
                 "codex-job-cancel",
+                "codex-model-list",
                 "codex-overview",
                 "codex-project-list",
                 "codex-repository-list",
@@ -1434,6 +1482,7 @@ class CodexMcpGuardContractTest(unittest.TestCase):
                 "codex-job-status",
                 "codex-job-steer",
                 "codex-job-cancel",
+                "codex-model-list",
                 "codex-overview",
                 "codex-project-list",
                 "codex-repository-list",
@@ -1575,6 +1624,16 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         )
         self.assertEqual(thread_start["params"]["cwd"], str(harness.workspace))
         self.assertNotIn("projectId", thread_start["params"])
+        self.assertNotIn("model", thread_start["params"])
+        self.assertNotIn("allowProviderModelFallback", thread_start["params"])
+        turn_start = next(
+            message for message in child_requests
+            if message.get("method") == "turn/start"
+        )
+        self.assertNotIn("model", turn_start["params"])
+        self.assertNotIn("effort", turn_start["params"])
+        self.assertIsNone(final["requestedModel"])
+        self.assertIsNone(final["requestedReasoningEffort"])
 
         continued = harness.call(4, "codex-reply-async", {
             "prompt": "continue existing repo inspection",
@@ -1587,6 +1646,122 @@ class CodexMcpGuardContractTest(unittest.TestCase):
         )["result"]["structuredContent"]
         self.assertEqual(continued_final["status"], "completed")
         self.assertEqual(continued_final["threadId"], final["threadId"])
+
+    def test_model_catalog_validates_and_forwards_durable_overrides(self):
+        harness = self.harness()
+        harness.initialize()
+
+        catalog = harness.call(3, "codex-model-list", {"limit": 1})
+        self.assertIn("result", catalog, catalog)
+        catalog_payload = catalog["result"]["structuredContent"]
+        self.assertEqual(catalog_payload["defaultModel"], "gpt-test-default")
+        self.assertEqual(catalog_payload["models"][0]["id"], "gpt-test-default")
+        self.assertTrue(
+            catalog_payload["nextCursor"].startswith("cgb2.models-cursor.")
+        )
+        second_page = harness.call(4, "codex-model-list", {
+            "limit": 1,
+            "cursor": catalog_payload["nextCursor"],
+        })["result"]["structuredContent"]
+        self.assertEqual(second_page["models"][0]["id"], "gpt-5.6-luna")
+        self.assertIsNone(second_page["nextCursor"])
+
+        invalid_model = harness.call(5, "codex-run", {
+            "prompt": "invalid model",
+            "model": "missing-model",
+        })
+        self.assertEqual(invalid_model["error"]["code"], -32010)
+        invalid_effort = harness.call(6, "codex-run", {
+            "prompt": "invalid effort",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "ultra",
+        })
+        self.assertEqual(invalid_effort["error"]["code"], -32010)
+        self.assertEqual(harness.job_directories(), [])
+
+        queued = harness.call(7, "codex-run", {
+            "prompt": "luna max run",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
+        })
+        job_id = queued["result"]["structuredContent"]["jobId"]
+        final = self.wait_for_job(harness, job_id)["result"]["structuredContent"]
+        self.assertEqual(final["requestedModel"], "gpt-5.6-luna")
+        self.assertEqual(final["requestedReasoningEffort"], "max")
+        child_requests = harness.read_child_state()["requests"]
+        thread_start = next(
+            item for item in child_requests if item.get("method") == "thread/start"
+        )
+        self.assertEqual(thread_start["params"]["model"], "gpt-5.6-luna")
+        self.assertFalse(thread_start["params"]["allowProviderModelFallback"])
+        turn_start = next(
+            item for item in child_requests if item.get("method") == "turn/start"
+        )
+        self.assertEqual(turn_start["params"]["model"], "gpt-5.6-luna")
+        self.assertEqual(turn_start["params"]["effort"], "max")
+
+        continued = harness.call(8, "codex-reply-async", {
+            "prompt": "luna low reply",
+            "threadId": final["threadId"],
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "low",
+        })
+        reply_job_id = continued["result"]["structuredContent"]["jobId"]
+        self.wait_for_job(harness, reply_job_id)
+        reply_requests = harness.read_child_state()["requests"]
+        thread_resume = next(
+            item for item in reply_requests if item.get("method") == "thread/resume"
+        )
+        self.assertEqual(thread_resume["params"]["model"], "gpt-5.6-luna")
+        reply_turn = next(
+            item for item in reply_requests if item.get("method") == "turn/start"
+        )
+        self.assertEqual(reply_turn["params"]["model"], "gpt-5.6-luna")
+        self.assertEqual(reply_turn["params"]["effort"], "low")
+
+        started = harness.call(9, "codex-start", {
+            "prompt": "luna max project",
+            "projectName": "Luna Fixture",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
+        })
+        start_job_id = started["result"]["structuredContent"]["jobId"]
+        self.wait_for_job(harness, start_job_id)
+        start_requests = harness.read_child_state()["requests"]
+        start_thread = next(
+            item for item in start_requests if item.get("method") == "thread/start"
+        )
+        start_turn = next(
+            item for item in start_requests if item.get("method") == "turn/start"
+        )
+        self.assertEqual(start_thread["params"]["model"], "gpt-5.6-luna")
+        self.assertEqual(start_turn["params"]["effort"], "max")
+
+    def test_turn_context_observation_reports_actual_values(self):
+        module_spec = importlib.util.spec_from_file_location(
+            "codex_mcp_guard_observation_test", GUARD
+        )
+        guard_module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(guard_module)
+        codex_home = self.root / "codex-home"
+        session_dir = codex_home / "sessions" / "2026" / "08" / "28"
+        session_dir.mkdir(parents=True)
+        session_path = session_dir / "rollout.jsonl"
+        session_path.write_text(json.dumps({
+            "type": "turn_context",
+            "payload": {
+                "turn_id": "turn-observed",
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+            },
+        }) + "\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            observed = guard_module.observe_turn_context(
+                {"thread": {"path": str(session_path)}}, "turn-observed"
+            )
+        self.assertEqual(observed["observedModel"], "gpt-5.6-luna")
+        self.assertEqual(observed["observedReasoningEffort"], "max")
+        self.assertEqual(observed["observationSource"], "session-turn-context")
 
     def test_async_jobs_expose_progress_report_and_task_return_contract(self):
         harness = self.harness(scenario="async_report")
