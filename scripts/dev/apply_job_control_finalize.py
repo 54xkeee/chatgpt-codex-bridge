@@ -65,8 +65,8 @@ tests = replace_once(
 )
 tests = replace_once(
     tests,
-    '        self.assertIn(\n            "MUST call codex-wait",\n            queued["result"]["content"][0]["text"],\n        )\n',
-    '        self.assertIn(\n            "durable",\n            queued["result"]["content"][0]["text"],\n        )\n        self.assertIn(\n            "codex-job-status",\n            queued["result"]["content"][0]["text"],\n        )\n',
+    '        self.assertEqual(structured["status"], "queued")\n        self.assertIn(\n            "MUST call codex-wait",\n            queued["result"]["content"][0]["text"],\n        )\n        self.assertIn("_meta", queued["result"])\n',
+    '        self.assertEqual(structured["status"], "queued")\n        self.assertIn(\n            "durable",\n            queued["result"]["content"][0]["text"],\n        )\n        self.assertIn(\n            "codex-job-status",\n            queued["result"]["content"][0]["text"],\n        )\n        self.assertIn("_meta", queued["result"])\n',
     "async start durable assertion",
 )
 tests = replace_once(
@@ -77,8 +77,7 @@ tests = replace_once(
 )
 
 # The raw project path remains durable internal state but must never appear in
-# model-visible job output.
-# Existing test already enforces this exact property.
+# model-visible job output. Existing tests enforce this exact property.
 
 anchor = '\n\nif __name__ == "__main__":\n'
 if anchor not in tests:
