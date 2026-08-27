@@ -51,7 +51,8 @@ JOB_WAIT_DEFAULT_SECONDS = 52.0
 JOB_WAIT_MAX_SECONDS = 55.0
 JOB_WAIT_POLL_SECONDS = 0.25
 JOB_CONTROL_POLL_SECONDS = 0.25
-JOB_CANCEL_GRACE_SECONDS = 1.5
+JOB_CANCEL_GRACE_SECONDS = 0.75
+JOB_CANCEL_WORKER_WAIT_SECONDS = 0.75
 JOB_CONTROL_MAX_ITEMS = 100
 TRANSCRIPT_MAX_ITEMS = 100
 TRANSCRIPT_TEXT_LIMIT = 60_000
@@ -165,7 +166,6 @@ ASYNC_OUTPUT_SCHEMA = {
             "type": "string",
             "enum": ["pending", "bridge-owned", "available", "unavailable"],
         },
-        "workspace": {"type": "string"},
         "projectName": {"type": "string"},
     },
     "required": [
@@ -1197,6 +1197,16 @@ def process_exists(pid):
             return exit_code.value == 259
         finally:
             ctypes.windll.kernel32.CloseHandle(process)
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        raw_stat = proc_stat.read_text(encoding="utf-8", errors="replace")
+        right_paren = raw_stat.rfind(")")
+        if right_paren >= 0:
+            fields = raw_stat[right_paren + 2 :].split()
+            if fields and fields[0] == "Z":
+                return False
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1583,6 +1593,11 @@ def terminate_verified_job_worker(job_dir, wait_seconds=3.0):
             time.sleep(0.05)
     if process_exists(pid):
         raise GuardProtocolError("managed worker did not stop")
+    if os.name != "nt":
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
     return True
 
 
@@ -1609,15 +1624,24 @@ def process_worker_controls(client, path, state, thread_id, turn_id, processed_i
                     "input": [{"type": "text", "text": prompt}],
                 },
             })
-            update_control_delivery(state, control_id, "sent")
+            append_transcript(
+                state, "controller", "steer", prompt, command.get("createdAt"),
+                "sent", control_id
+            )
             state["activity"] = "已向正在运行的 Codex 回合插入补充指令。"
         elif kind == "cancel":
+            reason = command.get("reason")
+            if not isinstance(reason, str):
+                raise GuardProtocolError("invalid cancel command")
             client.send({
                 "method": "turn/interrupt",
                 "id": "bridge-cancel-" + control_id,
                 "params": {"threadId": thread_id, "turnId": turn_id},
             })
-            update_control_delivery(state, control_id, "sent")
+            append_transcript(
+                state, "controller", "cancel", reason, command.get("createdAt"),
+                "sent", control_id
+            )
             state["activity"] = "已请求中断当前 Codex 回合。"
         else:
             raise GuardProtocolError("invalid job control command")
@@ -1679,7 +1703,16 @@ def public_job_state(state):
     if isinstance(report, dict):
         public["report"] = report
     transcript = state.get("transcript")
-    public["transcript"] = transcript if isinstance(transcript, list) else []
+    public_transcript = []
+    if isinstance(transcript, list):
+        for entry in transcript[:TRANSCRIPT_MAX_ITEMS]:
+            if not isinstance(entry, dict):
+                continue
+            public_transcript.append({
+                key: value for key, value in entry.items()
+                if key != "controlId"
+            })
+    public["transcript"] = public_transcript
     public["writerActive"] = bool(state.get("writerActive"))
     handoff = state.get("threadHandoff")
     public["threadHandoff"] = (
@@ -1687,9 +1720,8 @@ def public_job_state(state):
         if handoff in ("pending", "bridge-owned", "available", "unavailable")
         else ("bridge-owned" if public["writerActive"] else "unavailable")
     )
-    for key in ("workspace", "projectName"):
-        if isinstance(state.get(key), str):
-            public[key] = state[key]
+    if isinstance(state.get("projectName"), str):
+        public["projectName"] = state["projectName"]
     thread_id = state.get("threadId")
     if isinstance(thread_id, str) and thread_id:
         public["threadId"] = thread_id
@@ -2026,37 +2058,15 @@ class JobStore:
                 raise GuardProtocolError("invalid job state")
             worker = read_json_object(worker_path) if worker_path.is_file() else {"pid": None}
             if not process_exists(worker.get("pid")):
-                content = state.get("content") or "本机 Codex 后台进程已中断。"
-                state.update({
-                    "status": "interrupted",
-                    "content": content,
-                    "phase": "interrupted",
-                    "activity": content,
-                    "lastEventAt": time.time(),
-                    "failureStage": state.get("phase", "queued"),
-                    "nextAction": "repair",
-                    "updatedAt": time.time(),
-                })
-                finish_job_report(state, "interrupted", content, "repair")
-                atomic_write_json(path / "status.json", state)
+                _mark_job_interrupted(path, state, "本机 Codex 后台进程已中断。")
+                state = read_json_object(path / "status.json")
         if (
             reconcile
             and state.get("status") == "running"
             and not process_exists(state.get("pid"))
         ):
-            content = state.get("content") or "本机 Codex 后台进程已中断。"
-            state.update({
-                "status": "interrupted",
-                "content": content,
-                "phase": "interrupted",
-                "activity": content,
-                "lastEventAt": time.time(),
-                "failureStage": state.get("phase", "working"),
-                "nextAction": "repair",
-                "updatedAt": time.time(),
-            })
-            finish_job_report(state, "interrupted", content, "repair")
-            atomic_write_json(path / "status.json", state)
+            _mark_job_interrupted(path, state, "本机 Codex 后台进程已中断。")
+            state = read_json_object(path / "status.json")
         return state
 
     def _valid_project_workspace(self, raw_workspace, allow_bridge_workspace=False):
@@ -2348,12 +2358,6 @@ class JobStore:
         command[field] = text
         commands.append(command)
         atomic_write_json(control_path, {"commands": commands})
-        append_transcript(
-            state, "controller", kind, text, command["createdAt"], "queued", control_id
-        )
-        state["lastEventAt"] = command["createdAt"]
-        state["updatedAt"] = command["createdAt"]
-        atomic_write_json(path / "status.json", state)
         return control_id
 
     def steer(self, job_id, prompt):
@@ -2382,23 +2386,32 @@ class JobStore:
                 return state
             if state.get("status") == "queued":
                 message = reason or "Codex 后台任务已在启动前取消。"
-                append_transcript(state, "controller", "cancel", message, delivery="applied")
-                _mark_job_interrupted(path, state, message)
                 queued = True
             else:
                 message = reason or "请求停止当前 Codex 后台任务。"
                 self._append_control_locked(path, state, "cancel", message)
                 queued = False
         if queued:
-            terminate_verified_job_worker(path)
-            return self.read(job_id)
+            terminate_verified_job_worker(
+                path, wait_seconds=JOB_CANCEL_WORKER_WAIT_SECONDS
+            )
+            state = self._state_for_path(path, reconcile=False)
+            if state.get("status") in ACTIVE_JOB_STATUSES:
+                append_transcript(
+                    state, "controller", "cancel", message, delivery="applied"
+                )
+                _mark_job_interrupted(path, state, message)
+                state = self._state_for_path(path, reconcile=False)
+            return state
         deadline = time.monotonic() + JOB_CANCEL_GRACE_SECONDS
         state = self.read(job_id)
         while state.get("status") in ACTIVE_JOB_STATUSES and time.monotonic() < deadline:
             time.sleep(0.05)
             state = self.read(job_id)
         if state.get("status") in ACTIVE_JOB_STATUSES:
-            terminate_verified_job_worker(path)
+            terminate_verified_job_worker(
+                path, wait_seconds=JOB_CANCEL_WORKER_WAIT_SECONDS
+            )
             state = self._state_for_path(path, reconcile=False)
             if state.get("status") in ACTIVE_JOB_STATUSES:
                 _mark_job_interrupted(
