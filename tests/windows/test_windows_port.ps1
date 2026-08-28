@@ -66,6 +66,24 @@ foreach ($functionName in @('Test-FullyQualifiedPath','Quote-Cmd','Invoke-Checke
     if (-not (Test-Path -LiteralPath $runTunnelPath -PathType Leaf)) { throw 'runtime tunnel script is missing' }
     $runTunnel = [IO.File]::ReadAllText($runTunnelPath, [Text.Encoding]::UTF8)
     if ($runTunnel -notmatch '--mcp\.command "command=powershell\.exe .* -EncodedCommand [A-Za-z0-9+/=]+"') { throw 'tunnel command does not use the Unicode-safe encoded launcher' }
+    if ($runTunnel -notmatch '(?m)^:cgb_tunnel_retry\r?\n') { throw 'tunnel command does not define the retry loop' }
+    if ($runTunnel -notmatch '(?m)^timeout /t 5 /nobreak >nul 2>&1\r?\n') { throw 'tunnel command does not use the bounded retry delay' }
+    if ($runTunnel -notmatch '(?m)^goto cgb_tunnel_retry\r?\n') { throw 'tunnel command does not return to the retry loop' }
+    $loopProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/c',(Quote-Cmd $runTunnelPath)) -WorkingDirectory $state -WindowStyle Hidden -PassThru
+    try {
+        Start-Sleep -Seconds 1
+        if (-not (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue)) { throw 'tunnel retry loop exited after the first client exit' }
+        Start-Sleep -Seconds 5
+        if (-not (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue)) { throw 'tunnel retry loop did not survive a retry interval' }
+    } finally {
+        if (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue) {
+            & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $loopProcess.Id /T /F *> $null
+        }
+        for ($attempt = 0; $attempt -lt 20 -and (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue); $attempt++) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    if (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue) { throw 'tunnel retry loop process tree did not terminate' }
     & $python (Join-Path $PSScriptRoot 'test_guard_windows.py') --guard $config.runtime_guard --workspace $workspace --codex-bin $codex --python-bin $python
     if ($LASTEXITCODE -ne 0) { throw 'Guard MCP test failed' }
 

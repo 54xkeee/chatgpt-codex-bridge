@@ -8,6 +8,7 @@
 - **R4**: The Guard MUST support Windows file locking, stdio pipes, child-process creation/revocation, environment filtering, and Codex desktop project opening while preserving existing macOS behavior.
 - **R5**: `install`, `doctor`, `status`, `restart`, `stop`, and `uninstall` MUST have Windows PowerShell entry points.
 - **R6**: Installation MUST preserve external Tunnel profiles, Codex login, projects, and conversation history.
+- **R7**: After an unexpected `tunnel-client` exit, the generated Windows runtime MUST retry the same Tunnel command after a bounded delay while keeping one bridge-owned process tree. Explicit `stop`, `restart`, and `uninstall` MUST terminate that retry loop.
 
 ## Acceptance criteria
 
@@ -16,6 +17,7 @@
 3. A `--no-start` install followed by `doctor --no-start` succeeds with fixture Tunnel tooling.
 4. The installed Guard completes an MCP `initialize` and `tools/list` exchange with the local Codex MCP server.
 5. With a real profile and official `tunnel-client`, live `status` reports both local readiness and a recent control-plane poll.
+6. The generated Windows Tunnel command contains the bounded retry loop, and terminating its recorded parent process terminates the loop and its child Tunnel process.
 
 ## Non-goals
 

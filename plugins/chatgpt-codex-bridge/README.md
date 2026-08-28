@@ -139,7 +139,8 @@ does not grant ChatGPT, Codex, Tunnel, GitHub, or device credentials. Every user
 and device performs its own official Tunnel setup and ChatGPT authorization.
 
 Current platform support is macOS LaunchAgent and a Windows current-user Startup
-service. Linux service packaging is not implemented.
+service. The generated Windows Tunnel command retries after an unexpected exit.
+Linux service packaging is not implemented.
 
 Original architecture and macOS implementation by
 [@larryppgg](https://github.com/larryppgg). Windows port, global catalog, and

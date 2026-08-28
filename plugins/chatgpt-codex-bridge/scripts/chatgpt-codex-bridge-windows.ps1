@@ -234,7 +234,7 @@ function Install-Bridge {
     $guardInvocation = "& '" + $runtimeWrapperPs1.Replace("'", "''") + "' -Config '" + $configFile.Replace("'", "''") + "'"
     $guardEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($guardInvocation))
     $mcpCommand = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $guardEncoded
-    $runTunnel = '@echo off' + "`r`n@chcp 65001 >nul`r`n" + (Quote-Cmd $tunnelPath) + ' run --profile ' + (Quote-Cmd $Profile) + ' --health.listen-addr 127.0.0.1:0 --health.url-file ' + (Quote-Cmd $cfg.health_url_file) + ' --mcp.command ' + (Quote-Cmd ('command=' + $mcpCommand)) + ' 1>>' + (Quote-Cmd $cfg.stdout_log) + ' 2>>' + (Quote-Cmd $cfg.stderr_log) + "`r`n"
+    $runTunnel = '@echo off' + "`r`n@chcp 65001 >nul`r`n:cgb_tunnel_retry`r`n" + (Quote-Cmd $tunnelPath) + ' run --profile ' + (Quote-Cmd $Profile) + ' --health.listen-addr 127.0.0.1:0 --health.url-file ' + (Quote-Cmd $cfg.health_url_file) + ' --mcp.command ' + (Quote-Cmd ('command=' + $mcpCommand)) + ' 1>>' + (Quote-Cmd $cfg.stdout_log) + ' 2>>' + (Quote-Cmd $cfg.stderr_log) + "`r`ntimeout /t 5 /nobreak >nul 2>&1`r`ngoto cgb_tunnel_retry`r`n"
     [IO.File]::WriteAllText($runtimeTunnelCmd, $runTunnel, [Text.UTF8Encoding]::new($false))
     $startup = '@echo off' + "`r`n@chcp 65001 >nul`r`n" + 'start "" /min ' + (Quote-Cmd "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe") + ' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (Quote-Cmd $runtimeController) + " start-internal`r`n"
     [IO.File]::WriteAllText($startupFile, $startup, [Text.UTF8Encoding]::new($false))
