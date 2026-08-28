@@ -105,23 +105,38 @@ mailbox + overlay, cancel fallback + `terminate_verified_job_worker`,
 `_worker_command_matches`, resource limits, widget, catalog filesystem
 discovery, Windows tunnel lifecycle.
 
-## 3. Model/runtime configuration (fail closed)
+## 3. Model/runtime configuration (VERIFIED T1, fail closed)
 
-Headless materialization requires an explicit model provider. Verified error:
-`Model config is missing. Create ~\.zcode\cli\config.json with an explicit
-model provider` (code `model_config_missing`) — raised during
-`session/create` materialization.
+Resolved end-to-end against a local openai-compatible mock with isolated
+`USERPROFILE` (probe_h/probe_i in repo-external probe dir):
 
-Design: the bridge never fabricates credentials. Doctor (R25) probes for a
-resolvable model config; jobs failing with `model_config_missing` map to
-`failureStage: "zcode_model_config"`, `nextAction: "repair"`. First
-implementation step (T1) verifies, inside an isolated `ZCODE_STORAGE_DIR`,
-which of the supported paths works end-to-end:
-(a) `~/.zcode/cli/config.json` with `{source:"env"}` apiKeyRef,
-(b) `runtimeModel` supplied in `session/create`,
-(c) `workspace/upsertModelProvider` before create.
-Preference order: (a) — it is the CLI's documented path; (b)/(c) only if (a)
-cannot bind to builtin coding-plan providers.
+- Model ref config: `~/.zcode/cli/config.json` =
+  `{"model": {"main": "provider/model"}}` (schema: string ref or
+  `{main?, lite?}`, refine `provider/model`).
+- Provider definition: injected at runtime via
+  `workspace/upsertModelProvider {workspace, provider}` where provider =
+  `{providerId, kind: "openai-compatible", apiFormat: "openai-chat-completions",
+  baseURL, apiKey: {source: "env", name}, models: [{modelId, ...}]}`.
+  The bridge worker does this for nothing in production — the user's own
+  ZCode login/config provides the real provider; the bridge only verifies
+  resolvability (doctor) and maps `model_config_missing` to
+  `failureStage: "zcode_model_config"`, `nextAction: "repair"`.
+- `session/create` materializes the runtime and returns the full snapshot at
+  `result.session.sessionId`. The create `mode` param is ignored — the worker
+  calls `session/setMode {sessionId, mode}` (verified: yolo applied,
+  `state.updated reason=mode_changed`).
+- Terminal: `turn.completed` payload carries `response` (final answer) and
+  `resultType`; `turn.failed` carries `error`. `session/stop` ends the active
+  turn promptly (observed `turn.failed` with provider-abort error).
+- Steer: `session/send` while running → `turn.steerQueued {targetTurnId,
+  inputPreview}`; drain happens at the next model request within the turn
+  (`turn.steerDrained`). No optimistic-concurrency token needed by the bridge.
+- Server→client requests other than `session/requestRuntimePreferences`
+  (e.g. `interaction/requestOfficialMcpAuthHeaders`) are declined with a
+  JSON-RPC error reply; the session proceeds. Notification channels
+  (`state.updated`, `v4/telemetry/event`, `computer-use/operation-event`,
+  `process/mcpTelemetry`) are informational; `state.updated` status/reason
+  feeds activity/lastEvent.
 
 ## 4. Preset mapping
 

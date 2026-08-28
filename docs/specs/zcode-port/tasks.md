@@ -4,9 +4,21 @@ Status: in progress
 Order matters; keep diffs small; run guard tests after every task.
 
 - [x] T0 Spec + ADR-0019 committed.
-- [ ] T1 Verify headless materialization path (isolated `ZCODE_STORAGE_DIR`),
-      record chosen option (config.json vs runtimeModel vs registry) in this
-      file and ADR-0019.
+- [x] T1 Headless materialization verified end-to-end against a local
+      openai-compatible mock (probe_h/probe_i, isolated USERPROFILE):
+      `~/.zcode/cli/config.json` = `{"model":{"main":"provider/model"}}`;
+      provider definitions injected via `workspace/upsertModelProvider`
+      (`apiKey: {source:"env", name}`); `session/create` materializes and
+      returns `result.session.sessionId`; create's `mode` param does NOT stick
+      — worker MUST call `session/setMode` after create; `session/send`
+      returns `{accepted:true}` and drives `turn.started` → `model.streaming`
+      → `turn.completed{resultType,response}` (or `turn.failed`);
+      steer while running = `turn.steerQueued{targetTurnId}` (drain event
+      pending until next model request); `session/stop` terminates the turn
+      promptly (`turn.failed` on abort); unknown server requests
+      (`interaction/requestOfficialMcpAuthHeaders`) may be declined with an
+      error reply; extra notification channels (v4/telemetry, state.updated,
+      computer-use/*, process/*) are informational and ignored.
 - [ ] T2 Guard: `--provider`/`--zcode-bin`/`--zcode-cjs` config plumbing +
       validation + preset matrix.
 - [ ] T3 Guard: `ZcodeAppServerClient` (spawn/envelope/server-request
