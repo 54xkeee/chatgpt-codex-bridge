@@ -4,6 +4,8 @@ param(
     [string]$Profile = 'chatgpt-codex',
     [string]$Workspace = (Join-Path $HOME 'codex-workspace'),
     [string]$CodexBin,
+    [ValidateSet('codex','zcode')][string]$Provider = 'codex',
+    [string]$ZCodeBin,
     [string]$TunnelClientBin,
     [string]$PythonBin,
     [ValidateSet('personal-full-control','workspace-safe')][string]$Preset = 'personal-full-control',
@@ -174,12 +176,28 @@ function Wait-Ready([object]$Cfg) {
 }
 
 function Assert-Static([object]$Cfg) {
-    foreach ($path in @($Cfg.workspace,$Cfg.codex_bin,$Cfg.tunnel_client_bin,$Cfg.python_bin,$Cfg.runtime_guard,$Cfg.runtime_wrapper_ps1,$Cfg.runtime_wrapper_cmd,$Cfg.runtime_tunnel_cmd,$Cfg.workspace_new_project_skill)) {
+    $provider = if ($Cfg.PSObject.Properties.Name -contains 'provider') { $Cfg.provider } else { 'codex' }
+    $paths = @($Cfg.workspace,$Cfg.tunnel_client_bin,$Cfg.python_bin,$Cfg.runtime_guard,$Cfg.runtime_wrapper_ps1,$Cfg.runtime_wrapper_cmd,$Cfg.runtime_tunnel_cmd,$Cfg.workspace_new_project_skill)
+    if ($provider -eq 'zcode') {
+        $paths = @($paths) + @($Cfg.zcode_bin,$Cfg.zcode_cjs)
+    } else {
+        $paths = @($paths) + @($Cfg.codex_bin)
+    }
+    foreach ($path in $paths) {
+        if (-not $path) { throw 'installed path validation failed' }
         if (-not (Test-FullyQualifiedPath $path) -or -not (Test-Path -LiteralPath $path)) { throw 'installed path validation failed' }
     }
     Invoke-Checked $Cfg.tunnel_client_bin @('--version') 'tunnel-client is not usable'
     Invoke-Checked $Cfg.tunnel_client_bin @('doctor','--profile',$Cfg.profile) 'Tunnel profile doctor failed'
-    Invoke-Checked $Cfg.codex_bin @('--version') 'Codex is not usable'
+    if ($provider -eq 'zcode') {
+        # ZCode.exe is an Electron host: never launch it as a health probe.
+        $modelConfig = Join-Path $env:USERPROFILE '.zcode\cli\config.json'
+        if (-not (Test-Path -LiteralPath $modelConfig -PathType Leaf)) {
+            throw 'ZCode CLI model config missing (~/.zcode/cli/config.json); complete ZCode CLI login before installing the zcode provider'
+        }
+    } else {
+        Invoke-Checked $Cfg.codex_bin @('--version') 'Codex is not usable'
+    }
     if ($Cfg.PSObject.Properties.Name -contains 'runtime_guard_sha256') {
         if ((Get-GuardHash $Cfg.runtime_guard) -ne $Cfg.runtime_guard_sha256) { throw 'runtime Guard hash mismatch' }
     }
@@ -188,11 +206,26 @@ function Assert-Static([object]$Cfg) {
 function Install-Bridge {
     if ($Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw 'Tunnel profile name is invalid' }
     $workspacePath = Resolve-CanonicalDirectory $Workspace
-    $codexPath = Resolve-Program $CodexBin @('codex.cmd','codex.exe')
+    $codexPath = $null
+    $zcodePath = $null
+    $zcodeCjs = $null
+    if ($Provider -eq 'zcode') {
+        $zcodePath = Resolve-Program $ZCodeBin @('ZCode.exe')
+        $zcodeCjs = Resolve-CanonicalFile (Join-Path (Split-Path $zcodePath -Parent) 'resources\glm\zcode.cjs')
+    } else {
+        $codexPath = Resolve-Program $CodexBin @('codex.cmd','codex.exe')
+    }
     $tunnelPath = Resolve-Program $TunnelClientBin @('tunnel-client.exe','tunnel-client')
     $pythonPath = Resolve-Program $PythonBin @('python.exe','python3.exe')
     Invoke-Checked $tunnelPath @('doctor','--profile',$Profile) 'Tunnel profile doctor failed'
-    Invoke-Checked $codexPath @('--version') 'Codex is not usable'
+    if ($Provider -eq 'zcode') {
+        $modelConfig = Join-Path $env:USERPROFILE '.zcode\cli\config.json'
+        if (-not (Test-Path -LiteralPath $modelConfig -PathType Leaf)) {
+            throw 'ZCode CLI model config missing (~/.zcode/cli/config.json); complete ZCode CLI login before installing the zcode provider'
+        }
+    } else {
+        Invoke-Checked $codexPath @('--version') 'Codex is not usable'
+    }
     Invoke-Checked $pythonPath @('--version') 'Python is not usable'
 
     if (Test-Path -LiteralPath $configFile) {
@@ -219,7 +252,9 @@ function Install-Bridge {
     $sourceGuardHash = Get-GuardHash $sourceGuard
     $runtimeGuardHash = Get-GuardHash $runtimeGuard
     $cfg = [ordered]@{
-        profile=$Profile; workspace=$workspacePath; codex_bin=$codexPath; tunnel_client_bin=$tunnelPath; python_bin=$pythonPath
+        profile=$Profile; provider=$Provider; workspace=$workspacePath; codex_bin=$codexPath
+        zcode_bin=$zcodePath; zcode_cjs=$zcodeCjs
+        tunnel_client_bin=$tunnelPath; python_bin=$pythonPath
         preset=$Preset; sandbox=$policy[0]; approval_policy=$policy[1]
         runtime_guard=$runtimeGuard; runtime_wrapper_ps1=$runtimeWrapperPs1; runtime_wrapper_cmd=$runtimeWrapperCmd
         runtime_tunnel_cmd=$runtimeTunnelCmd; runtime_controller=$runtimeController

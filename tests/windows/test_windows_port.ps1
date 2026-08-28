@@ -87,6 +87,44 @@ foreach ($functionName in @('Test-FullyQualifiedPath','Quote-Cmd','Invoke-Checke
     & $python (Join-Path $PSScriptRoot 'test_guard_windows.py') --guard $config.runtime_guard --workspace $workspace --codex-bin $codex --python-bin $python
     if ($LASTEXITCODE -ne 0) { throw 'Guard MCP test failed' }
 
+    $zcodeDir = Join-Path $buildRoot 'zcode-fake'
+    $zcodeExe = Join-Path $zcodeDir 'ZCode.exe'
+    $zcodeCjs = Join-Path $zcodeDir 'resources\glm\zcode.cjs'
+    New-Item -ItemType Directory -Force -Path (Join-Path $zcodeDir 'resources\glm') | Out-Null
+    Copy-Item -LiteralPath $fakeTunnel -Destination $zcodeExe -Force
+    [IO.File]::WriteAllText($zcodeCjs, '// fake zcode cli bundle', [Text.ASCIIEncoding]::new())
+
+    $oldHomeDrive = $env:HOMEDRIVE
+    $oldHomePath = $env:HOMEPATH
+    $oldUserProfile = $env:USERPROFILE
+    $fakeHome = Join-Path $testRoot 'fakehome'
+    New-Item -ItemType Directory -Force -Path (Join-Path $fakeHome '.zcode\cli') | Out-Null
+    $homeRoot = [IO.Path]::GetPathRoot($fakeHome)
+    try {
+        $env:HOMEDRIVE = $homeRoot.TrimEnd('\')
+        $env:HOMEPATH = $fakeHome.Substring($homeRoot.Length)
+        $env:USERPROFILE = $fakeHome
+        $zcodeRejected = $false
+        try {
+            & $controller install -Profile windows-zcode -Workspace $workspace -Provider zcode -ZCodeBin $zcodeExe -TunnelClientBin $fakeTunnel -PythonBin $python -Preset workspace-safe -NoStart -ErrorAction Stop
+        } catch {
+            if ($_.Exception.Message -match 'model config missing') { $zcodeRejected = $true } else { throw }
+        }
+        if (-not $zcodeRejected) { throw 'zcode install did not fail closed without a ZCode CLI model config' }
+        [IO.File]::WriteAllText((Join-Path $fakeHome '.zcode\cli\config.json'), '{"model":{"main":"builtin:bigmodel-start-plan/GLM-5.3-Flash"}}', [Text.ASCIIEncoding]::new())
+        & $controller install -Profile windows-zcode -Workspace $workspace -Provider zcode -ZCodeBin $zcodeExe -TunnelClientBin $fakeTunnel -PythonBin $python -Preset workspace-safe -NoStart
+        & $controller doctor -NoStart
+        $zcodeConfig = [IO.File]::ReadAllText((Join-Path $state 'config.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($zcodeConfig.provider -ne 'zcode') { throw 'zcode install did not record the provider' }
+        if ($zcodeConfig.zcode_bin -ne $zcodeExe -or $zcodeConfig.zcode_cjs -ne $zcodeCjs) { throw 'zcode install did not record the executor paths' }
+        if (([IO.File]::ReadAllText((Join-Path $state 'config.json'), [Text.Encoding]::UTF8)) -match '"codex_bin":\s*"[^"]+"') { throw 'zcode install must not record a codex binary' }
+    } finally {
+        $env:HOMEDRIVE = $oldHomeDrive
+        $env:HOMEPATH = $oldHomePath
+        $env:USERPROFILE = $oldUserProfile
+    }
+
+
     $bootstrapRoot = Join-Path $testRoot 'bootstrap'
     New-Item -ItemType Directory -Path $bootstrapRoot | Out-Null
     Push-Location $bootstrapRoot
