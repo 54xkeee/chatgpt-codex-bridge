@@ -5,6 +5,7 @@
 > Windows 本机真正编辑代码、运行命令和测试。
 
 [English](README.md) · [Windows 实测证明](docs/WINDOWS_LIVE_PROOF.md) ·
+[项目背景速览](docs/PROJECT-CONTEXT.zh-CN.md) ·
 [原始项目](https://github.com/larryppgg/chatgpt-codex-bridge)
 
 这是 [`larryppgg/chatgpt-codex-bridge`](https://github.com/larryppgg/chatgpt-codex-bridge)
