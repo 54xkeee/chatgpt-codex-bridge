@@ -4,6 +4,12 @@
 > bridge keeps repositories, Codex threads, progress, and results visible to
 > both sides.
 
+> ⚠️ **DORMANT BRANCH — DO NOT USE (development stopped 2026-08-28).**
+> This branch holds the shelved ZCode execution-provider port
+> (`-Provider zcode`). It never passed end-to-end acceptance (spec task T10
+> was never run) and is unmaintained. Use the `main` branch (Codex edition)
+> instead. See [ADR-0020](docs/adr/0020-zcode-port-shelved.md).
+
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)](#windows-quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Original project](https://img.shields.io/badge/upstream-larryppgg%2Fchatgpt--codex--bridge-181717)](https://github.com/larryppgg/chatgpt-codex-bridge)

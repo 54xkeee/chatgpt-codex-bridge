@@ -1,5 +1,10 @@
 # ChatGPT Codex Bridge
 
+> ⚠️ **DORMANT BRANCH — DO NOT INSTALL.** This is the shelved ZCode
+> execution-provider port (development stopped 2026-08-28, end-to-end
+> acceptance never run, unmaintained). Use `main` (Codex edition).
+> See [ADR-0020](../../docs/adr/0020-zcode-port-shelved.md).
+
 > ChatGPT Pro in the loop: ChatGPT supervises; local Codex executes.
 
 [中文图文说明](../../README.zh-CN.md) ·

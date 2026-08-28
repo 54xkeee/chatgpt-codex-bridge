@@ -14,32 +14,21 @@
 
 核心机制：durable job（request/status/controls/worker 四文件、single-writer）、有界 wait（默认 52s/上限 55s）、同回合 steer、按 job 取消（canonical 中断 → 短 grace → 已验证归属才杀进程树，宁可失败不误杀）、签名 capability（`cgb2.*`）、Windows Tunnel 生命周期（install/doctor/status/restart/stop/uninstall，含退出自愈重试，ADR-0018）。
 
-## 当前状态（2026-08-28）
+## 当前状态（2026-08-28：已搁置）
 
-**ZCode 执行后端移植已完成**（版本 `0.7.0+zcode.20260828234419`）：
+**ZCode 移植已停止开发，本分支（`zcode-port`）仅作存档：请勿安装、请勿使用。**
+实现与 73 项契约测试都在，但端到端验收（规格 T10）从未执行，分支不再维护。
+请使用 `main` 分支的 Codex 版。背景见 [ADR-0020](../adr/0020-zcode-port-shelved.md)。
 
-- 安装器 `-Provider {codex,zcode}`，一次安装只服务一个后端，工具名带前缀（`codex-*` / `zcode-*`）。
-- zcode 后端驱动 ZCode 桌面 CLI 自带的 `app-server --stdio` 协议（`ZCode.exe resources\glm\zcode.cjs`，`ELECTRON_RUN_AS_NODE=1`）——与 Codex 的 app-server 同构，协议到协议适配，没有套壳。
-- steer = 运行中 `session/send`（ZCode 原生同回合输入，有 `turn.steerQueued/Drained` 事件）；cancel = `session/stop` → 短 grace → 既有已验证 worker 兜底。
-- 预设真实映射：`personal-full-control` = yolo；`workspace-safe` = build + Bridge 一律拒绝权限请求（无人在侧，默认拒绝）。
-- 同步短任务工具（`zcode`/`zcode-reply`）= app-server 短生命周期会话实现；不使用未验证的 `--prompt` headless 模式。
-- 测试：Codex 契约 60 项 + ZCode 契约 12 项（FAKE_ZCODE 模拟协议）全绿，均已接入 CI；Windows PowerShell 5.1 套件（含中文路径、zcode 安装正/负路径）通过。
+## 如要恢复
+
+从 `zcode-port` 分支出发，先补完 T10 端到端验收（brief §41）并重新评估
+provider 接缝与 `main` 的冲突，再谈使用。
 
 ## 关键决策（详见 docs/adr/）
 
 - **ADR-0018**：Windows Tunnel 意外退出后 5 秒有界重试，单一 bridge-owned 进程树，不引入第二个监督进程。
 - **ADR-0019**：provider 接缝——provider 只存在于 1 个 client 类 + 6 个编排函数 + preset 映射 + 测试 fake + CLI 参数；JobStore/签名/controls/取消兜底/进程归属/Tunnel 生命周期全部后端无关。未来加新执行后端（如 dsh）只需新增这些点，前提是有可编程执行接口；能力缺失就诚实降级，不伪造。
-
-## 唯一待办
-
-**配置模型密钥并重装**（headless 实例无法复用桌面端注入的凭证，实测确认；
-官方目前也没有独立 CLI 分发）。已实现的路径（无需 config.json、无需 CLI）：
-1. 到智谱开放平台拿一个 API key，设为用户环境变量 `BIGMODEL_API_KEY`；
-2. 安装：`install -Provider zcode -ZCodeBin D:\ZCode\ZCode.exe -ZCodeModelBaseUrl https://open.bigmodel.cn/api/anthropic -ZCodeModel GLM-5.3`（安装器生成 runtime\zcode-model.json，doctor 校验环境变量，fail closed）；
-3. 从 ChatGPT 对话发 `zcode-run` 任务验收。worker 启动时通过
-   `workspace/upsertModelProvider` 注入 provider 定义（API key 以
-   `{source:"env"}` 引用环境变量，**Bridge 不落盘密钥**）。
-   备选路径：已有 `~/.zcode/cli/config.json` 的用户可不传模型参数。
 
 ## 去哪看
 

@@ -4,6 +4,12 @@
 > ChatGPT 负责理解目标、查阅仓库与历史对话、分派和审查；Codex 负责在
 > Windows 本机真正编辑代码、运行命令和测试。
 
+> ⚠️ **休眠分支 · 请勿使用（2026-08-28 起停止开发）**
+> 本分支是已搁置的 ZCode 执行后端移植（`-Provider zcode`）。它从未跑通
+> 端到端验收（规格 T10 未执行），已停止维护，不接受任何修复。请回到
+> `main` 分支使用 Codex 版。背景见
+> [ADR-0020](docs/adr/0020-zcode-port-shelved.md)。
+
 [English](README.md) · [Windows 实测证明](docs/WINDOWS_LIVE_PROOF.md) ·
 [项目背景速览](docs/PROJECT-CONTEXT.zh-CN.md) ·
 [原始项目](https://github.com/larryppgg/chatgpt-codex-bridge)
