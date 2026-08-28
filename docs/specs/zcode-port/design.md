@@ -105,32 +105,47 @@ mailbox + overlay, cancel fallback + `terminate_verified_job_worker`,
 `_worker_command_matches`, resource limits, widget, catalog filesystem
 discovery, Windows tunnel lifecycle.
 
-## 3. Model/runtime configuration (VERIFIED T1, fail closed)
+## 3. Model/runtime configuration (VERIFIED, fail closed)
 
-Resolved end-to-end against a local openai-compatible mock with isolated
-`USERPROFILE` (probe_h/probe_i in repo-external probe dir):
+Verified end-to-end twice: first against a local openai-compatible mock with
+isolated `USERPROFILE` (probe_h/probe_i), then against the real BigModel
+endpoint shape on the real workspace (probe_upsert_noconfig).
 
-- Model ref config: `~/.zcode/cli/config.json` =
-  `{"model": {"main": "provider/model"}}` (schema: string ref or
-  `{main?, lite?}`, refine `provider/model`).
-- Provider definition: injected at runtime via
-  `workspace/upsertModelProvider {workspace, provider}` where provider =
-  `{providerId, kind: "openai-compatible", apiFormat: "openai-chat-completions",
-  baseURL, apiKey: {source: "env", name}, models: [{modelId, ...}]}`.
-  The bridge worker does this for nothing in production — the user's own
-  ZCode login/config provides the real provider; the bridge only verifies
-  resolvability (doctor) and maps `model_config_missing` to
-  `failureStage: "zcode_model_config"`, `nextAction: "repair"`.
-- `session/create` materializes the runtime and returns the full snapshot at
-  `result.session.sessionId`. The create `mode` param is ignored — the worker
-  calls `session/setMode {sessionId, mode}` (verified: yolo applied,
-  `state.updated reason=mode_changed`).
+Established facts:
+- The desktop GUI injects its provider config into its own app-server
+  processes at runtime and does NOT persist it to shared storage — a
+  bridge-spawned instance sees `providers=[]` and fails `model_config_missing`
+  (the shipped `resources/model-providers` catalog is not loaded headless
+  either; both builtin coding-plan ids fail with "missing baseURL").
+- There is no official standalone CLI distribution (install docs ship only
+  the Electron desktop app).
+- The verified headless path needs NO config.json: the worker calls
+  `workspace/upsertModelProvider {workspace, provider}` with
+  `{providerId, kind: "anthropic", baseURL, apiKey: {source: "env", name},
+  models: [{modelId, …}]}` and then passes `model: {providerId, modelId}` in
+  `session/create`. The API key is read from the environment at request time;
+  the bridge never persists it.
+
+Wiring: the installer writes `runtime\zcode-model.json`
+(`{providerId, label, baseURL, apiKeyEnv, model}`) from
+`-ZCodeModelBaseUrl/-ZCodeModel/-ZCodeApiKeyEnv` and records it as
+`zcode_provider_config`; the worker validates and loads it
+(`load_zcode_provider_config`), upserts, and creates. Doctor fails closed
+when the named environment variable is unset. The legacy fallback (an
+   existing `~/.zcode/cli/config.json`) remains supported. Jobs that still fail
+   materialization map to `failureStage: "zcode_model_config"`,
+   `nextAction: "repair"`.
+
+Other verified protocol facts (probe_h/probe_i):
+- `session/create` returns the runtime snapshot at `result.session.sessionId`;
+  the create `mode` param is ignored, so the worker calls
+  `session/setMode {sessionId, mode}` after create.
 - Terminal: `turn.completed` payload carries `response` (final answer) and
   `resultType`; `turn.failed` carries `error`. `session/stop` ends the active
-  turn promptly (observed `turn.failed` with provider-abort error).
-- Steer: `session/send` while running → `turn.steerQueued {targetTurnId,
-  inputPreview}`; drain happens at the next model request within the turn
-  (`turn.steerDrained`). No optimistic-concurrency token needed by the bridge.
+  turn promptly (observed `turn.failed` with a provider-abort error).
+- Steer: `session/send` while running → `turn.steerQueued {targetTurnId}`;
+  drain happens at the next model request within the turn
+  (`turn.steerDrained`). No optimistic-concurrency token is needed.
 - Server→client requests other than `session/requestRuntimePreferences`
   (e.g. `interaction/requestOfficialMcpAuthHeaders`) are declined with a
   JSON-RPC error reply; the session proceeds. Notification channels

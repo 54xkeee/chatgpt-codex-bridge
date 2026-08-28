@@ -7,11 +7,16 @@ $cfg = [IO.File]::ReadAllText($configPath, [Text.Encoding]::UTF8) | ConvertFrom-
 $provider = if ($cfg.PSObject.Properties.Name -contains 'provider') { $cfg.provider } else { 'codex' }
 
 if ($provider -eq 'zcode') {
+    $providerArgs = @()
+    if ($cfg.PSObject.Properties.Name -contains 'zcode_provider_config' -and $cfg.zcode_provider_config -and (Test-Path -LiteralPath $cfg.zcode_provider_config -PathType Leaf)) {
+        $providerArgs = @('--zcode-provider-config', $cfg.zcode_provider_config)
+    }
     & $cfg.python_bin $cfg.runtime_guard `
         --workspace $cfg.workspace `
         --provider zcode `
         --zcode-bin $cfg.zcode_bin `
         --zcode-cjs $cfg.zcode_cjs `
+        @providerArgs `
         --job-state-dir $cfg.job_state_dir `
         --sandbox $cfg.sandbox `
         --approval-policy $cfg.approval_policy `

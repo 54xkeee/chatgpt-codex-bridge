@@ -77,7 +77,13 @@ foreach ($functionName in @('Test-FullyQualifiedPath','Quote-Cmd','Invoke-Checke
         if (-not (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue)) { throw 'tunnel retry loop did not survive a retry interval' }
     } finally {
         if (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue) {
-            & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $loopProcess.Id /T /F *> $null
+            $previousEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $loopProcess.Id /T /F *> $null
+            } finally {
+                $ErrorActionPreference = $previousEap
+            }
         }
         for ($attempt = 0; $attempt -lt 20 -and (Get-Process -Id $loopProcess.Id -ErrorAction SilentlyContinue); $attempt++) {
             Start-Sleep -Milliseconds 100
@@ -118,6 +124,29 @@ foreach ($functionName in @('Test-FullyQualifiedPath','Quote-Cmd','Invoke-Checke
         if ($zcodeConfig.provider -ne 'zcode') { throw 'zcode install did not record the provider' }
         if ($zcodeConfig.zcode_bin -ne $zcodeExe -or $zcodeConfig.zcode_cjs -ne $zcodeCjs) { throw 'zcode install did not record the executor paths' }
         if (([IO.File]::ReadAllText((Join-Path $state 'config.json'), [Text.Encoding]::UTF8)) -match '"codex_bin":\s*"[^"]+"') { throw 'zcode install must not record a codex binary' }
+
+        $preExistingKey = [Environment]::GetEnvironmentVariable('BIGMODEL_API_KEY','User') -or [Environment]::GetEnvironmentVariable('BIGMODEL_API_KEY','Machine')
+        if (-not $preExistingKey) {
+            $bootstrapRejected = $false
+            try {
+                & $controller install -Profile windows-zcode-model -Workspace $workspace -Provider zcode -ZCodeBin $zcodeExe -ZCodeModelBaseUrl 'https://open.bigmodel.cn/api/anthropic' -ZCodeModel 'GLM-5.3' -TunnelClientBin $fakeTunnel -PythonBin $python -Preset workspace-safe -NoStart -ErrorAction Stop
+            } catch {
+                if ($_.Exception.Message -match 'environment variable BIGMODEL_API_KEY is not set') { $bootstrapRejected = $true } else { throw }
+            }
+            if (-not $bootstrapRejected) { throw 'zcode model bootstrap install did not fail closed without the API key environment variable' }
+        }
+        $env:BIGMODEL_API_KEY = 'test-only-key'
+        try {
+            & $controller install -Profile windows-zcode-model -Workspace $workspace -Provider zcode -ZCodeBin $zcodeExe -ZCodeModelBaseUrl 'https://open.bigmodel.cn/api/anthropic' -ZCodeModel 'GLM-5.3' -TunnelClientBin $fakeTunnel -PythonBin $python -Preset workspace-safe -NoStart
+            & $controller doctor -NoStart
+            $modelBootstrap = [IO.File]::ReadAllText((Join-Path $runtime 'zcode-model.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($modelBootstrap.apiKeyEnv -ne 'BIGMODEL_API_KEY' -or $modelBootstrap.model -ne 'GLM-5.3') { throw 'zcode model bootstrap file is incomplete' }
+            if ($modelBootstrap.baseURL -ne 'https://open.bigmodel.cn/api/anthropic') { throw 'zcode model bootstrap baseURL is wrong' }
+            $bootstrapState = [IO.File]::ReadAllText((Join-Path $state 'config.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($bootstrapState.zcode_provider_config -ne (Join-Path $runtime 'zcode-model.json')) { throw 'zcode install did not record the model bootstrap file' }
+        } finally {
+            Remove-Item Env:BIGMODEL_API_KEY -ErrorAction SilentlyContinue
+        }
     } finally {
         $env:HOMEDRIVE = $oldHomeDrive
         $env:HOMEPATH = $oldHomePath

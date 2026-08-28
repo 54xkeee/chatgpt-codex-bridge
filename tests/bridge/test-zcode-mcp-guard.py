@@ -103,7 +103,22 @@ def main():
                 record({"prefs_reply": line})
             continue
 
+        if method == "workspace/upsertModelProvider":
+            provider = params.get("provider") or {}
+            state.setdefault("providers", []).append(provider.get("providerId"))
+            reply(request_id, {"modelCatalog": {
+                "revision": len(state["providers"]),
+                "providers": [provider],
+                "available": [],
+            }})
+            continue
+
         if method == "session/create":
+            if scenario == "needs_provider":
+                requested_provider = (params.get("model") or {}).get("providerId")
+                if requested_provider not in state.get("providers", []):
+                    reply_error(request_id, -32603, "", "provider not registered for this workspace")
+                    continue
             if scenario == "model_config_missing":
                 reply_error(request_id, -32603, "model_config_missing",
                             "Model config is missing. Create ~/.zcode/cli/config.json with an explicit model provider before running ZCode.")
@@ -296,7 +311,8 @@ PUBLIC_TOOLS_FULL = (
 
 
 class ZcodeGuardHarness:
-    def __init__(self, workspace, scenario="normal", preset="full", job_wait_seconds=0.5):
+    def __init__(self, workspace, scenario="normal", preset="full", job_wait_seconds=0.5,
+                 provider_config=None):
         self.workspace = str(workspace)
         self.root = Path(tempfile.mkdtemp(prefix="zcode-guard-harness-"))
         self.fake_dir = self.root / "fake-zcode"
@@ -320,6 +336,12 @@ class ZcodeGuardHarness:
             "--job-state-dir", str(self.jobs_dir),
             "--job-wait-seconds", str(job_wait_seconds),
         ]
+        if provider_config:
+            provider_path = self.root / "zcode-model.json"
+            provider_path.write_text(
+                json.dumps(provider_config), encoding="utf-8"
+            )
+            args += ["--zcode-provider-config", str(provider_path)]
         if preset == "full":
             args += ["--sandbox", "danger-full-access", "--approval-policy", "never"]
         else:
@@ -668,6 +690,35 @@ class ZcodeMcpGuardContractTest(unittest.TestCase):
         structured = response["result"]["structuredContent"]
         self.assertTrue(structured["threadId"])
         self.assertIn("quick diagnostic", structured["content"])
+
+    def test_worker_bootstraps_provider_without_storing_the_key(self):
+        harness = self.start_guard(
+            scenario="needs_provider",
+            provider_config={
+                "baseURL": "https://open.bigmodel.cn/api/anthropic",
+                "apiKeyEnv": "BIGMODEL_API_KEY",
+                "model": "GLM-5.3",
+            },
+        )
+        harness.initialize()
+        response = harness.call_tool("zcode-run", {"prompt": "needs a provider"}, 590)
+        job_id = response["result"]["structuredContent"]["jobId"]
+        final = harness.wait_for_terminal(job_id, 591)
+        terminal = final["result"]["structuredContent"]
+        self.assertEqual(terminal["status"], "completed")
+        upserts = [
+            entry["received"]["params"].get("provider")
+            for entry in harness.fake_state()
+            if entry.get("received", {}).get("method") == "workspace/upsertModelProvider"
+        ]
+        self.assertEqual(len(upserts), 1)
+        self.assertEqual(upserts[0]["providerId"], "bridge-managed")
+        self.assertEqual(upserts[0]["baseURL"], "https://open.bigmodel.cn/api/anthropic")
+        self.assertEqual(
+            upserts[0]["apiKey"], {"source": "env", "name": "BIGMODEL_API_KEY"}
+        )
+        serialized = json.dumps(harness.fake_state(), ensure_ascii=False)
+        self.assertNotIn("BIGMODEL_API_KEY_VALUE", serialized)
 
     def test_catalog_lists_sessions_inside_roots_only(self):
         harness = self.start_guard(scenario="normal")

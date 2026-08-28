@@ -1982,12 +1982,14 @@ class JobStore:
         provider="codex",
         zcode_bin=None,
         zcode_cjs=None,
+        zcode_provider_config=None,
     ):
         self.root = Path(root)
         self.codex_bin = codex_bin
         self.provider = provider
         self.zcode_bin = zcode_bin
         self.zcode_cjs = zcode_cjs
+        self.zcode_provider_config = zcode_provider_config
         self.workspace = workspace
         self.sandbox = sandbox
         self.approval_policy = approval_policy
@@ -2313,6 +2315,11 @@ class JobStore:
                     "--zcode-cjs",
                     self.zcode_cjs,
                 ])
+                if self.zcode_provider_config:
+                    command.extend([
+                        "--zcode-provider-config",
+                        self.zcode_provider_config,
+                    ])
             else:
                 command.extend([
                     "--codex-bin",
@@ -4247,6 +4254,54 @@ def run_job(
     return 0 if state["status"] == "completed" else EXIT_PROTOCOL
 
 
+ZCODE_PROVIDER_CONFIG_DEFAULT_ID = "bridge-managed"
+
+
+def load_zcode_provider_config(path):
+    """Load the optional bridge-managed model provider definition used to
+    bootstrap headless ZCode sessions. The API key is never stored here —
+    only the environment variable name that holds it."""
+    payload = read_json_object(Path(path))
+    if not isinstance(payload, dict):
+        raise GuardConfigurationError()
+    allowed = {
+        "providerId", "label", "baseURL", "apiKeyEnv", "model",
+        "contextWindow", "maxOutputTokens",
+    }
+    if set(payload) - allowed or not isinstance(payload.get("baseURL"), str) or not payload["baseURL"].strip():
+        raise GuardConfigurationError()
+    if not isinstance(payload.get("apiKeyEnv"), str) or not payload["apiKeyEnv"].strip():
+        raise GuardConfigurationError()
+    if not isinstance(payload.get("model"), str) or not payload["model"].strip():
+        raise GuardConfigurationError()
+    provider_id = payload.get("providerId")
+    if provider_id is None:
+        provider_id = ZCODE_PROVIDER_CONFIG_DEFAULT_ID
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        raise GuardConfigurationError()
+    label = payload.get("label")
+    if label is not None and not isinstance(label, str):
+        raise GuardConfigurationError()
+    entry = {
+        "providerId": provider_id,
+        "kind": "anthropic",
+        "label": label or "Bridge Managed Model Provider",
+        "source": "workspace",
+        "baseURL": payload["baseURL"].strip(),
+        "apiKey": {"source": "env", "name": payload["apiKeyEnv"].strip()},
+        "models": [{
+            "modelId": payload["model"].strip(),
+            "contextWindow": payload.get("contextWindow")
+            if isinstance(payload.get("contextWindow"), int)
+            else 200_000,
+            "maxOutputTokens": payload.get("maxOutputTokens")
+            if isinstance(payload.get("maxOutputTokens"), int)
+            else 32_000,
+        }],
+    }
+    return entry, payload["model"].strip()
+
+
 def zcode_message_text_parts(payload):
     """Extract (role, texts, patch_files) from a message.upserted payload.
     `reasoning` parts are deliberately dropped: they are private."""
@@ -4332,6 +4387,7 @@ def run_zcode_job(configuration):
     workspace = configuration.get("workspace")
     zcode_bin = configuration.get("zcode_bin")
     zcode_cjs = configuration.get("zcode_cjs")
+    zcode_provider_config = configuration.get("zcode_provider_config")
     sandbox = configuration.get("sandbox")
     approval_policy = configuration.get("approval_policy")
     capability_key_path = configuration.get("capability_key_path", "")
@@ -4564,13 +4620,40 @@ def run_zcode_job(configuration):
             "updatedAt": stage_time,
         })
         atomic_write_json(path / "status.json", state)
+        provider_entry = None
+        model_ref = None
+        if zcode_provider_config:
+            provider_entry, model_id = load_zcode_provider_config(
+                zcode_provider_config
+            )
+            model_ref = {
+                "providerId": provider_entry["providerId"],
+                "modelId": model_id,
+            }
+            client.request(
+                1,
+                "workspace/upsertModelProvider",
+                {
+                    "workspace": {
+                        "workspaceKey": workspace,
+                        "workspacePath": workspace,
+                    },
+                    "provider": provider_entry,
+                },
+            )
+            next_request_id = 2
+        else:
+            next_request_id = 1
         create_params = {
             "workspace": {"workspaceKey": workspace, "workspacePath": workspace},
             "mode": "yolo",
         }
+        if model_ref:
+            create_params["model"] = model_ref
         if requested_internal_thread:
             create_params["sessionId"] = requested_internal_thread
-        create_result = client.request(1, "session/create", create_params)
+        create_result = client.request(next_request_id, "session/create", create_params)
+        next_request_id += 1
         session = create_result.get("session")
         raw_session_id = (
             session.get("sessionId") if isinstance(session, dict) else None
@@ -4581,7 +4664,12 @@ def run_zcode_job(configuration):
             raise GuardProtocolError("ZCode resumed the wrong session")
         session_id = raw_session_id
         public_thread_id = capabilities.encode("thread", session_id)
-        client.request(2, "session/setMode", {"sessionId": session_id, "mode": "yolo"})
+        client.request(
+            next_request_id,
+            "session/setMode",
+            {"sessionId": session_id, "mode": "yolo"},
+        )
+        next_request_id += 1
         state.update({
             "threadId": public_thread_id,
             "internalThreadId": session_id,
@@ -4606,11 +4694,12 @@ def run_zcode_job(configuration):
             "updatedAt": stage_time,
         })
         atomic_write_json(path / "status.json", state)
-        client.request(3, "session/send", {
+        client.request(next_request_id, "session/send", {
             "sessionId": session_id,
             "content": prompt,
             "inputId": "bridge-initial-" + str(internal_job_id),
         })
+        next_request_id += 1
         state["writerActive"] = True
         state["threadHandoff"] = "bridge-owned"
         state["updatedAt"] = time.time()
@@ -4806,12 +4895,14 @@ class CodexMcpGuard:
         provider="codex",
         zcode_bin=None,
         zcode_cjs=None,
+        zcode_provider_config=None,
     ):
         self.provider = provider
         self.workspace = workspace
         self.codex_bin = codex_bin
         self.zcode_bin = zcode_bin
         self.zcode_cjs = zcode_cjs
+        self.zcode_provider_config = zcode_provider_config
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.job_wait_seconds = job_wait_seconds
@@ -4845,6 +4936,7 @@ class CodexMcpGuard:
             provider=provider,
             zcode_bin=zcode_bin,
             zcode_cjs=zcode_cjs,
+            zcode_provider_config=zcode_provider_config,
         )
         if provider == "zcode":
             self.catalog = ZcodeCatalog(
@@ -5797,6 +5889,7 @@ class ZcodeMcpGuard(CodexMcpGuard):
         max_retained_jobs=JOB_MAX_RETAINED_DEFAULT,
         job_max_seconds=JOB_MAX_SECONDS_DEFAULT,
         sync_max_seconds=SYNC_MAX_SECONDS_DEFAULT,
+        zcode_provider_config=None,
     ):
         super().__init__(
             workspace,
@@ -5813,6 +5906,7 @@ class ZcodeMcpGuard(CodexMcpGuard):
             provider="zcode",
             zcode_bin=zcode_bin,
             zcode_cjs=zcode_cjs,
+            zcode_provider_config=zcode_provider_config,
         )
 
     def start_child(self):
@@ -6147,6 +6241,7 @@ def parse_configuration(argv):
     parser.add_argument("--codex-bin", default=None)
     parser.add_argument("--zcode-bin", default=None)
     parser.add_argument("--zcode-cjs", default=None)
+    parser.add_argument("--zcode-provider-config", default=None)
     parser.add_argument(
         "--desktop-open-bin",
         default=DEFAULT_DESKTOP_OPEN_BIN,
@@ -6204,6 +6299,7 @@ def parse_configuration(argv):
     codex_bin = None
     zcode_bin = None
     zcode_cjs = None
+    zcode_provider_config = None
     if provider == "zcode":
         if not arguments.zcode_bin or not arguments.zcode_cjs:
             raise GuardConfigurationError()
@@ -6213,6 +6309,10 @@ def parse_configuration(argv):
         zcode_cjs = require_real_absolute_path(
             arguments.zcode_cjs, want_directory=False
         )
+        if arguments.zcode_provider_config:
+            zcode_provider_config = require_real_absolute_path(
+                arguments.zcode_provider_config, want_directory=False
+            )
         desktop_open_bin = DEFAULT_DESKTOP_OPEN_BIN
     else:
         if not arguments.codex_bin:
@@ -6262,6 +6362,7 @@ def parse_configuration(argv):
         "codex_bin": codex_bin,
         "zcode_bin": zcode_bin,
         "zcode_cjs": zcode_cjs,
+        "zcode_provider_config": zcode_provider_config,
         "desktop_open_bin": desktop_open_bin,
         "sandbox": arguments.sandbox,
         "approval_policy": arguments.approval_policy,
@@ -6290,6 +6391,7 @@ def parse_worker_configuration(argv):
     parser.add_argument("--desktop-open-bin", default=None)
     parser.add_argument("--zcode-bin", default=None)
     parser.add_argument("--zcode-cjs", default=None)
+    parser.add_argument("--zcode-provider-config", default=None)
     parser.add_argument("--workspace-new-project-skill", default="")
     parser.add_argument("--capability-key-path", default="")
     parser.add_argument("--capability-workspace", default="")
@@ -6311,6 +6413,7 @@ def parse_worker_configuration(argv):
     codex_bin = None
     zcode_bin = None
     zcode_cjs = None
+    zcode_provider_config = None
     desktop_open_bin = None
     if provider == "zcode":
         if not arguments.zcode_bin or not arguments.zcode_cjs:
@@ -6321,6 +6424,10 @@ def parse_worker_configuration(argv):
         zcode_cjs = require_real_absolute_path(
             arguments.zcode_cjs, want_directory=False
         )
+        if arguments.zcode_provider_config:
+            zcode_provider_config = require_real_absolute_path(
+                arguments.zcode_provider_config, want_directory=False
+            )
     else:
         if not arguments.codex_bin or not arguments.desktop_open_bin:
             raise GuardConfigurationError()
@@ -6362,6 +6469,7 @@ def parse_worker_configuration(argv):
         "desktop_open_bin": desktop_open_bin,
         "zcode_bin": zcode_bin,
         "zcode_cjs": zcode_cjs,
+        "zcode_provider_config": zcode_provider_config,
         "sandbox": arguments.sandbox,
         "approval_policy": arguments.approval_policy,
         "workspace_new_project_skill": workspace_new_project_skill,
@@ -6422,6 +6530,7 @@ def main(argv=None):
         "max_retained_jobs": configuration["max_retained_jobs"],
         "job_max_seconds": configuration["job_max_seconds"],
         "sync_max_seconds": configuration["sync_max_seconds"],
+        "zcode_provider_config": configuration["zcode_provider_config"],
     }
     if configuration["provider"] == "zcode":
         guard = ZcodeMcpGuard(

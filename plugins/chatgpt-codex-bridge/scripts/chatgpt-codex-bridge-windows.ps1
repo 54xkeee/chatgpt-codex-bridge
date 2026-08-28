@@ -6,6 +6,9 @@ param(
     [string]$CodexBin,
     [ValidateSet('codex','zcode')][string]$Provider = 'codex',
     [string]$ZCodeBin,
+    [string]$ZCodeModelBaseUrl,
+    [string]$ZCodeModel,
+    [string]$ZCodeApiKeyEnv = 'BIGMODEL_API_KEY',
     [string]$TunnelClientBin,
     [string]$PythonBin,
     [ValidateSet('personal-full-control','workspace-safe')][string]$Preset = 'personal-full-control',
@@ -112,7 +115,15 @@ function Stop-Tunnel([object]$Cfg) {
     $process = Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue" -ErrorAction SilentlyContinue
     if ($process) {
         if ($process.CommandLine.IndexOf($Cfg.runtime_tunnel_cmd, [StringComparison]::OrdinalIgnoreCase) -lt 0) { throw 'bridge process ownership check failed' }
-        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $pidValue /T /F *> $null
+        # taskkill races exiting children of the tunnel retry loop; its stderr
+        # must not become a terminating error under Stop error preference.
+        $previousEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $pidValue /T /F *> $null
+        } finally {
+            $ErrorActionPreference = $previousEap
+        }
     }
     Remove-Item -LiteralPath $Cfg.pid_file -Force -ErrorAction SilentlyContinue
 }
@@ -191,9 +202,22 @@ function Assert-Static([object]$Cfg) {
     Invoke-Checked $Cfg.tunnel_client_bin @('doctor','--profile',$Cfg.profile) 'Tunnel profile doctor failed'
     if ($provider -eq 'zcode') {
         # ZCode.exe is an Electron host: never launch it as a health probe.
-        $modelConfig = Join-Path $env:USERPROFILE '.zcode\cli\config.json'
-        if (-not (Test-Path -LiteralPath $modelConfig -PathType Leaf)) {
-            throw 'ZCode CLI model config missing (~/.zcode/cli/config.json); complete ZCode CLI login before installing the zcode provider'
+        if ($Cfg.PSObject.Properties.Name -contains 'zcode_provider_config' -and $Cfg.zcode_provider_config) {
+            $modelConfigPath = $Cfg.zcode_provider_config
+            $modelConfig = [IO.File]::ReadAllText($modelConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $envName = $modelConfig.apiKeyEnv
+            $hasKey = $false
+            foreach ($scope in @('Process','User','Machine')) {
+                if ([Environment]::GetEnvironmentVariable($envName, $scope)) { $hasKey = $true; break }
+            }
+            if (-not $hasKey) {
+                throw "environment variable $envName is not set; put your model provider API key in it before installing the zcode provider"
+            }
+        } else {
+            $modelConfigPath = Join-Path $env:USERPROFILE '.zcode\cli\config.json'
+            if (-not (Test-Path -LiteralPath $modelConfigPath -PathType Leaf)) {
+                throw 'ZCode CLI model config missing (~/.zcode/cli/config.json); complete ZCode CLI login before installing the zcode provider'
+            }
         }
     } else {
         Invoke-Checked $Cfg.codex_bin @('--version') 'Codex is not usable'
@@ -209,9 +233,13 @@ function Install-Bridge {
     $codexPath = $null
     $zcodePath = $null
     $zcodeCjs = $null
+    $zcodeModelFile = $null
     if ($Provider -eq 'zcode') {
         $zcodePath = Resolve-Program $ZCodeBin @('ZCode.exe')
         $zcodeCjs = Resolve-CanonicalFile (Join-Path (Split-Path $zcodePath -Parent) 'resources\glm\zcode.cjs')
+        if ([bool]$ZCodeModelBaseUrl -xor [bool]$ZCodeModel) {
+            throw '-ZCodeModelBaseUrl and -ZCodeModel must be provided together'
+        }
     } else {
         $codexPath = Resolve-Program $CodexBin @('codex.cmd','codex.exe')
     }
@@ -249,11 +277,19 @@ function Install-Bridge {
     Copy-Item -LiteralPath (Join-Path $sourceSkillDir 'scripts\create_workspace_project.ps1') -Destination $runtimeSkillScripts -Force
 
     $policy = if ($Preset -eq 'personal-full-control') { @('danger-full-access','never') } else { @('workspace-write','on-request') }
+    if ($Provider -eq 'zcode' -and $ZCodeModelBaseUrl) {
+        $zcodeModelFile = Join-Path $runtimeDir 'zcode-model.json'
+        $zcodeModelPayload = [ordered]@{
+            providerId='bridge-managed'; label='Bridge Managed Model Provider'
+            baseURL=$ZCodeModelBaseUrl; apiKeyEnv=$ZCodeApiKeyEnv; model=$ZCodeModel
+        }
+        [IO.File]::WriteAllText($zcodeModelFile, ($zcodeModelPayload | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    }
     $sourceGuardHash = Get-GuardHash $sourceGuard
     $runtimeGuardHash = Get-GuardHash $runtimeGuard
     $cfg = [ordered]@{
         profile=$Profile; provider=$Provider; workspace=$workspacePath; codex_bin=$codexPath
-        zcode_bin=$zcodePath; zcode_cjs=$zcodeCjs
+        zcode_bin=$zcodePath; zcode_cjs=$zcodeCjs; zcode_provider_config=$zcodeModelFile
         tunnel_client_bin=$tunnelPath; python_bin=$pythonPath
         preset=$Preset; sandbox=$policy[0]; approval_policy=$policy[1]
         runtime_guard=$runtimeGuard; runtime_wrapper_ps1=$runtimeWrapperPs1; runtime_wrapper_cmd=$runtimeWrapperCmd

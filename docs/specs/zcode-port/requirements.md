@@ -112,8 +112,10 @@ paths.
 R24 config.json MUST gain `provider`, `zcode_bin`, `zcode_cjs`; run-guard MUST
 pass `--provider`/`--zcode-bin`/`--zcode-cjs`.
 R25 Doctor MUST verify: ZCode.exe present, zcode.cjs present, and — for the
-zcode provider — a resolvable model config (`~/.zcode/cli/config.json` or an
-explicitly configured model provider), failing closed with a repair hint.
+zcode provider — a resolvable model provider: either a bridge-managed
+bootstrap file (`zcode_model.json` with `apiKeyEnv` pointing at a set
+environment variable) or an existing `~/.zcode/cli/config.json`, failing
+closed with a repair hint.
 R26 Stop/restart/uninstall MUST keep the exact Codex-era safety ordering
 (stop tunnel → verify ownership → revoke jobs → interrupt), reusing the
 existing worker.json verification unchanged.

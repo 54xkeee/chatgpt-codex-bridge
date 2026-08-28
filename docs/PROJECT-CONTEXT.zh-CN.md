@@ -32,10 +32,14 @@
 
 ## 唯一待办
 
-**真实凭证端到端验证**：headless 运行需要 `~/.zcode/cli/config.json`（ZCode CLI 登录产物；桌面端不受影响）。步骤：
-1. 完成 ZCode CLI 登录，生成该文件；
-2. `install -Provider zcode -ZCodeBin D:\ZCode\ZCode.exe ...`（安装器会校验该文件，缺失即 fail closed）；
-3. 从 ChatGPT 对话发 `zcode-run` 任务，按 `docs/specs/zcode-port/requirements.md` §9 验收。
+**配置模型密钥并重装**（headless 实例无法复用桌面端注入的凭证，实测确认；
+官方目前也没有独立 CLI 分发）。已实现的路径（无需 config.json、无需 CLI）：
+1. 到智谱开放平台拿一个 API key，设为用户环境变量 `BIGMODEL_API_KEY`；
+2. 安装：`install -Provider zcode -ZCodeBin D:\ZCode\ZCode.exe -ZCodeModelBaseUrl https://open.bigmodel.cn/api/anthropic -ZCodeModel GLM-5.3`（安装器生成 runtime\zcode-model.json，doctor 校验环境变量，fail closed）；
+3. 从 ChatGPT 对话发 `zcode-run` 任务验收。worker 启动时通过
+   `workspace/upsertModelProvider` 注入 provider 定义（API key 以
+   `{source:"env"}` 引用环境变量，**Bridge 不落盘密钥**）。
+   备选路径：已有 `~/.zcode/cli/config.json` 的用户可不传模型参数。
 
 ## 去哪看
 

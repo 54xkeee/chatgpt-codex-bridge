@@ -33,8 +33,12 @@ Order matters; keep diffs small; run guard tests after every task.
       (tests/bridge/test-zcode-mcp-guard.py, wired into CI) — all green;
       60 Codex cases still green.
 - [ ] T8 Windows: `-Provider/-ZCodeBin` in controller, `run-guard-windows.ps1`
-      args, doctor model-config check; extend `test_windows_port.ps1`
+      args, doctor checks; extend `test_windows_port.ps1`
       (zcode fixture, Chinese path suite).
+- [ ] T8b Model provider bootstrap: installer `-ZCodeModelBaseUrl/-ZCodeModel/
+      -ZCodeApiKeyEnv` writes `zcode-model.json`; worker upserts the provider
+      (env-referenced key) and creates with `model`; doctor fails closed when
+      the env var is unset; Stop-Tunnel taskkill made race-tolerant.
 - [ ] T9 Docs: plugin.json version, README.md + README.zh-CN.md provider
       sections; runtime identity hash re-verified after reinstall.
 - [ ] T10 End-to-end Definition of Done (brief §41) on this machine; record
