@@ -93,6 +93,7 @@ APP_SERVER_CLIENT_TITLE = "ChatGPT Codex Bridge"
 APP_SERVER_CLIENT_VERSION = "0.6.1"
 CODEX_DESKTOP_BUNDLE_ID = "com.openai.codex"
 DEFAULT_DESKTOP_OPEN_BIN = shutil.which("codex") if os.name == "nt" else "/usr/bin/open"
+ZCODE_RUNTIME_PREFERENCES = {"nativeSearchEnhancementsEnabled": False}
 PROJECT_SCAFFOLD_FILES = ("AGENTS.md", "README.md", ".gitignore")
 PROJECT_SCAFFOLD_DIRECTORIES = (
     ".project-memory",
@@ -486,7 +487,7 @@ def async_tool_meta(visibility):
     }
 
 
-def build_public_tools(sandbox, approval_policy):
+def _build_codex_public_tools(sandbox, approval_policy):
     policy_description = SUPPORTED_POLICIES[(sandbox, approval_policy)]
     tools = [
         {
@@ -841,6 +842,33 @@ def build_public_tools(sandbox, approval_policy):
         },
     ])
     return tools
+
+
+PROVIDER_LABELS = {"codex": "Codex", "zcode": "ZCode"}
+
+
+def _rename_public_tools(tools, prefix):
+    label = PROVIDER_LABELS.get(prefix, prefix)
+    renamed = []
+    for tool in tools:
+        tool = json.loads(json.dumps(tool, ensure_ascii=False))
+        name = tool.get("name")
+        if isinstance(name, str) and name.startswith("codex"):
+            tool["name"] = prefix + name[len("codex"):]
+        description = tool.get("description")
+        if isinstance(description, str):
+            tool["description"] = (
+                description.replace("codex-", prefix + "-").replace("Codex", label)
+            )
+        renamed.append(tool)
+    return renamed
+
+
+def build_public_tools(sandbox, approval_policy, prefix="codex"):
+    tools = _build_codex_public_tools(sandbox, approval_policy)
+    if prefix == "codex":
+        return tools
+    return _rename_public_tools(tools, prefix)
 
 
 class GuardConfigurationError(Exception):
@@ -1951,9 +1979,15 @@ class JobStore:
         max_active_jobs=JOB_MAX_ACTIVE_DEFAULT,
         max_retained_jobs=JOB_MAX_RETAINED_DEFAULT,
         job_max_seconds=JOB_MAX_SECONDS_DEFAULT,
+        provider="codex",
+        zcode_bin=None,
+        zcode_cjs=None,
     ):
         self.root = Path(root)
         self.codex_bin = codex_bin
+        self.provider = provider
+        self.zcode_bin = zcode_bin
+        self.zcode_cjs = zcode_cjs
         self.workspace = workspace
         self.sandbox = sandbox
         self.approval_policy = approval_policy
@@ -2259,10 +2293,6 @@ class JobStore:
                 str(path),
                 "--workspace",
                 workspace,
-                "--codex-bin",
-                self.codex_bin,
-                "--desktop-open-bin",
-                self.desktop_open_bin,
                 "--capability-key-path",
                 str(self.capabilities.key_path),
                 "--capability-workspace",
@@ -2274,6 +2304,22 @@ class JobStore:
                 "--approval-policy",
                 self.approval_policy,
             ]
+            if self.provider == "zcode":
+                command.extend([
+                    "--provider",
+                    "zcode",
+                    "--zcode-bin",
+                    self.zcode_bin,
+                    "--zcode-cjs",
+                    self.zcode_cjs,
+                ])
+            else:
+                command.extend([
+                    "--codex-bin",
+                    self.codex_bin,
+                    "--desktop-open-bin",
+                    self.desktop_open_bin,
+                ])
             if self.workspace_new_project_skill:
                 command.extend([
                     "--workspace-new-project-skill",
@@ -2640,6 +2686,152 @@ class AppServerClient:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait(timeout=2.0)
+
+
+class ZcodeAppServerClient(AppServerClient):
+    """Speaks the ZCode Protocol NDJSON envelope (no "jsonrpc" member) and
+    answers server->client requests on the shared read path."""
+
+    def __init__(self, zcode_bin, zcode_cjs, workspace, event_handler, deadline):
+        self.event_handler = event_handler
+        self.deadline = deadline
+        self.buffer = bytearray()
+        environment = filtered_child_environment()
+        environment["ELECTRON_RUN_AS_NODE"] = "1"
+        self.process = subprocess.Popen(
+            [zcode_bin, zcode_cjs, "app-server", "--stdio"],
+            cwd=workspace,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            env=environment,
+        )
+        if self.process.stdin is None or self.process.stdout is None:
+            self.close()
+            raise OSError("missing ZCode App Server stdio")
+        self.pipe_reader = (
+            PipeChunkReader({"app-server": self.process.stdout})
+            if os.name == "nt"
+            else None
+        )
+
+    def _read_line(self, timeout_seconds=None):
+        if self.process.stdout is None:
+            raise GuardProtocolError("ZCode App Server stdout unavailable")
+        read_deadline = self.deadline
+        if timeout_seconds is not None:
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise GuardProtocolError("invalid App Server read timeout")
+            read_deadline = min(read_deadline, time.monotonic() + timeout_seconds)
+        while b"\n" not in self.buffer:
+            remaining = read_deadline - time.monotonic()
+            if remaining <= 0:
+                if time.monotonic() >= self.deadline:
+                    raise JobDeadlineExceeded("ZCode job deadline exceeded")
+                return None
+            if self.pipe_reader is not None:
+                event = self.pipe_reader.get(timeout=remaining)
+                if event is None:
+                    if time.monotonic() >= self.deadline:
+                        raise JobDeadlineExceeded("ZCode job deadline exceeded")
+                    return None
+                _source, chunk, read_error = event
+                if read_error is not None:
+                    raise GuardProtocolError(
+                        "ZCode App Server read failed"
+                    ) from read_error
+            else:
+                ready, _, _ = select.select([self.process.stdout], [], [], remaining)
+                if not ready:
+                    if time.monotonic() >= self.deadline:
+                        raise JobDeadlineExceeded("ZCode job deadline exceeded")
+                    return None
+                try:
+                    chunk = os.read(self.process.stdout.fileno(), 65_536)
+                except OSError as error:
+                    raise GuardProtocolError(
+                        "ZCode App Server read failed"
+                    ) from error
+            if not chunk:
+                raise GuardProtocolError("ZCode App Server exited unexpectedly")
+            self.buffer.extend(chunk)
+            if len(self.buffer) > MAX_LINE_BYTES:
+                raise GuardProtocolError("ZCode App Server event too large")
+        newline = self.buffer.find(b"\n")
+        raw_line = bytes(self.buffer[:newline])
+        del self.buffer[: newline + 1]
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+        if len(raw_line) > MAX_LINE_BYTES:
+            raise GuardProtocolError("ZCode App Server event too large")
+        try:
+            message = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise GuardProtocolError("malformed ZCode App Server event") from error
+        if not isinstance(message, dict):
+            raise GuardProtocolError("invalid ZCode App Server event")
+        return message
+
+    def read(self, timeout_seconds=None):
+        while True:
+            message = self._read_line(timeout_seconds)
+            if message is None:
+                return None
+            if "method" in message and "id" in message:
+                self._answer_server_request(message)
+                continue
+            return message
+
+    def _answer_server_request(self, message):
+        request_id = message.get("id")
+        if message.get("method") == "session/requestRuntimePreferences":
+            self.send({
+                "id": request_id,
+                "result": dict(ZCODE_RUNTIME_PREFERENCES),
+            })
+            return
+        self.send({
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": "bridge does not answer this server request",
+            },
+        })
+
+    @staticmethod
+    def _error_detail(message):
+        error = message.get("error")
+        if not isinstance(error, dict):
+            return ""
+        data = error.get("data")
+        parts = []
+        if isinstance(data, dict):
+            if isinstance(data.get("code"), str):
+                parts.append(data["code"])
+            if isinstance(data.get("message"), str):
+                parts.append(data["message"])
+        if isinstance(error.get("message"), str):
+            parts.append(error["message"])
+        return ": ".join(parts)[:300]
+
+    def request(self, request_id, method, params):
+        self.send({"id": request_id, "method": method, "params": params})
+        while True:
+            message = self.read()
+            if message is None:
+                continue
+            if message.get("id") == request_id and "method" not in message:
+                if "error" in message:
+                    raise GuardProtocolError(
+                        "ZCode App Server request failed: "
+                        + self._error_detail(message)
+                    )
+                result = message.get("result")
+                if not isinstance(result, dict):
+                    raise GuardProtocolError("invalid ZCode App Server response")
+                return result
+            self.event_handler(message)
 
 
 def bounded_text(value, limit=CATALOG_TEXT_LIMIT, tail=False):
@@ -3186,6 +3378,229 @@ class CodexCatalog:
             "jobs": jobs[:10],
             "degraded": degraded,
         }
+
+
+class ZcodeCatalog(CodexCatalog):
+    """Read-only catalog over the ZCode Protocol session/* surface. ZCode has
+    no server-side project objects; project discovery stays workspace-local."""
+
+    def __init__(self, workspace, zcode_bin, zcode_cjs, capabilities, job_store):
+        super().__init__(workspace, None, capabilities, job_store)
+        self.zcode_bin = zcode_bin
+        self.zcode_cjs = zcode_cjs
+
+    def open_client(self):
+        return ZcodeAppServerClient(
+            self.zcode_bin,
+            self.zcode_cjs,
+            self.workspace,
+            lambda _message: None,
+            time.monotonic() + CATALOG_DEADLINE_SECONDS,
+        )
+
+    def public_thread(self, session, roots=None):
+        if not isinstance(session, dict):
+            raise GuardProtocolError("invalid ZCode session")
+        raw_session_id = session.get("sessionId")
+        if not isinstance(raw_session_id, str) or not raw_session_id:
+            raise GuardProtocolError("invalid ZCode session")
+        roots = self.roots() if roots is None else roots
+        workspace_info = session.get("workspace")
+        workspace_path = (
+            workspace_info.get("workspacePath")
+            if isinstance(workspace_info, dict)
+            else None
+        )
+        cwd = require_known_catalog_root(workspace_path, roots)
+        title = session.get("title")
+        if not isinstance(title, str) or not title.strip():
+            title = Path(cwd).name
+        status = scalar_text(session.get("status"))
+        git = git_repository_probe(cwd) or {}
+        return {
+            "threadId": self.capabilities.encode("thread", raw_session_id),
+            "projectId": self.capabilities.encode("project", cwd),
+            "name": bounded_text(title.strip(), 200),
+            "cwd": cwd,
+            "preview": "",
+            "status": status,
+            "createdAt": session.get("createdAt") if isinstance(session.get("createdAt"), int) else 0,
+            "updatedAt": session.get("updatedAt") if isinstance(session.get("updatedAt"), int) else 0,
+            "branch": bounded_text(git.get("branch"), 500),
+            "sha": "",
+            "canAcceptDirectInput": status == "idle",
+        }
+
+    def list_sessions(self, client):
+        response = client.request(1, "session/list", {})
+        sessions = response.get("sessions")
+        if not isinstance(sessions, list):
+            raise GuardProtocolError("invalid ZCode session list")
+        return sessions
+
+    @staticmethod
+    def _session_workspace_path(session):
+        workspace_info = session.get("workspace")
+        if isinstance(workspace_info, dict):
+            path = workspace_info.get("workspacePath")
+            if isinstance(path, str):
+                return path
+        return None
+
+    def _matched_sessions(self, client, roots, query=None):
+        sessions = self.list_sessions(client)
+        known = {catalog_path_key(root) for root in roots}
+        matched = []
+        for session in sessions:
+            workspace_path = self._session_workspace_path(session)
+            if (
+                not isinstance(workspace_path, str)
+                or catalog_path_key(workspace_path) not in known
+            ):
+                continue
+            if query:
+                title = session.get("title")
+                if not isinstance(title, str) or query.casefold() not in title.casefold():
+                    continue
+            matched.append(session)
+        matched.sort(
+            key=lambda item: item.get("updatedAt")
+            if isinstance(item.get("updatedAt"), int)
+            else 0,
+            reverse=True,
+        )
+        return matched
+
+    def thread_list(self, arguments):
+        limit = catalog_page_limit(arguments)
+        roots = self.roots()
+        project_id = arguments.get("projectId")
+        if project_id is not None:
+            project_path = self.capabilities.decode("project", project_id)
+            roots = [require_known_catalog_root(project_path, roots)]
+        query = arguments.get("query")
+        if query is not None and (not isinstance(query, str) or len(query) > 500):
+            raise GuardProtocolError("invalid thread query")
+        raw_cursor = decode_catalog_cursor(
+            self.capabilities, "threads-cursor", arguments.get("cursor")
+        )
+        offset = 0
+        if raw_cursor is not None:
+            try:
+                offset = int(raw_cursor)
+            except ValueError as error:
+                raise GuardProtocolError("invalid thread cursor") from error
+            if offset < 0:
+                raise GuardProtocolError("invalid thread cursor")
+        client = self.open_client()
+        try:
+            matched = self._matched_sessions(client, roots, query)
+        finally:
+            client.close()
+        page = matched[offset:offset + limit]
+        next_offset = offset + limit
+        next_cursor = str(next_offset) if next_offset < len(matched) else None
+        return {
+            "threads": [self.public_thread(session, roots) for session in page],
+            "nextCursor": encode_catalog_cursor(
+                self.capabilities, "threads-cursor", next_cursor
+            ),
+        }
+
+    def _public_message_item(self, message):
+        if not isinstance(message, dict):
+            return None
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        role = info.get("role") or message.get("role")
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            parts = info.get("parts")
+        texts = []
+        if isinstance(parts, list):
+            for part in parts:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    texts.append(part["text"])
+        if not texts:
+            return None
+        text = bounded_text("\n".join(texts))
+        if role == "user":
+            return {"type": "userMessage", "text": text}
+        if role in ("assistant", "agent"):
+            return {"type": "agentMessage", "text": text}
+        return None
+
+    def thread_read(self, arguments):
+        limit = catalog_page_limit(arguments)
+        public_thread_id = arguments.get("threadId")
+        if not isinstance(public_thread_id, str):
+            raise GuardProtocolError("invalid thread capability")
+        raw_session_id = self.capabilities.decode("thread", public_thread_id)
+        roots = self.roots()
+        client = self.open_client()
+        try:
+            metadata = client.request(1, "session/read", {"sessionId": raw_session_id})
+            session = (
+                metadata.get("session")
+                if isinstance(metadata.get("session"), dict)
+                else metadata
+            )
+            public = self.public_thread(session, roots)
+            messages = client.request(
+                2,
+                "session/messages",
+                {"sessionId": raw_session_id, "limit": limit},
+            )
+        finally:
+            client.close()
+        message_list = messages.get("messages")
+        if not isinstance(message_list, list):
+            raise GuardProtocolError("invalid ZCode session history")
+        turns = []
+        for message in reversed(message_list[-limit:]):
+            item = self._public_message_item(message)
+            if item is None:
+                continue
+            turns.append({
+                "status": "",
+                "startedAt": None,
+                "completedAt": None,
+                "durationMs": None,
+                "items": [item],
+            })
+        return {"thread": public, "turns": turns, "nextCursor": None}
+
+    def resolve_thread_workspace(self, public_thread_id):
+        raw_session_id = self.capabilities.decode("thread", public_thread_id)
+        roots = self.roots()
+        client = self.open_client()
+        try:
+            sessions = self.list_sessions(client)
+        finally:
+            client.close()
+        for session in sessions:
+            if session.get("sessionId") == raw_session_id:
+                public = self.public_thread(session, roots)
+                return public["cwd"]
+        raise GuardProtocolError("invalid thread capability")
+
+    def thread_snapshot(self, roots, limit=CATALOG_MAX_LIMIT):
+        client = self.open_client()
+        try:
+            threads = [
+                self.public_thread(session, roots)
+                for session in self._matched_sessions(client, roots)
+            ]
+        finally:
+            client.close()
+        counts = {}
+        for thread in threads:
+            key = catalog_path_key(thread["cwd"])
+            counts[key] = counts.get(key, 0) + 1
+        return threads, counts
 
 
 def app_server_project(result, expected_name, expected_workspace):
@@ -3832,6 +4247,547 @@ def run_job(
     return 0 if state["status"] == "completed" else EXIT_PROTOCOL
 
 
+def zcode_message_text_parts(payload):
+    """Extract (role, texts, patch_files) from a message.upserted payload.
+    `reasoning` parts are deliberately dropped: they are private."""
+    if not isinstance(payload, dict):
+        return "", [], []
+    body = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+    info = body.get("info") if isinstance(body.get("info"), dict) else {}
+    role = body.get("role") or info.get("role") or ""
+    texts = []
+    patch_files = []
+    parts = body.get("parts")
+    if not isinstance(parts, list):
+        parts = payload.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif part_type == "patch":
+                files = part.get("files")
+                if isinstance(files, list):
+                    patch_files.extend(
+                        str(file_path) for file_path in files if file_path
+                    )
+    return str(role), texts, patch_files
+
+
+def process_zcode_worker_controls(client, path, state, session_id, processed_ids, flags):
+    if not session_id:
+        return
+    for command in read_controls(path):
+        if not isinstance(command, dict):
+            raise GuardProtocolError("invalid job control state")
+        control_id = command.get("id")
+        kind = command.get("kind")
+        if not isinstance(control_id, str) or not control_id or control_id in processed_ids:
+            continue
+        if kind == "steer":
+            prompt = command.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                raise GuardProtocolError("invalid steer command")
+            client.send({
+                "id": "bridge-steer-" + control_id,
+                "method": "session/send",
+                "params": {
+                    "sessionId": session_id,
+                    "content": prompt,
+                    "inputId": "bridge-steer-" + control_id,
+                },
+            })
+            append_transcript(
+                state, "controller", "steer", prompt, command.get("createdAt"),
+                "sent", control_id
+            )
+            state["activity"] = "已向正在运行的 ZCode 回合插入补充指令。"
+        elif kind == "cancel":
+            reason = command.get("reason")
+            if not isinstance(reason, str):
+                raise GuardProtocolError("invalid cancel command")
+            client.send({
+                "id": "bridge-cancel-" + control_id,
+                "method": "session/stop",
+                "params": {"sessionId": session_id},
+            })
+            append_transcript(
+                state, "controller", "cancel", reason, command.get("createdAt"),
+                "sent", control_id
+            )
+            state["activity"] = "已请求中断当前 ZCode 回合。"
+            flags["cancel_requested"] = True
+        else:
+            raise GuardProtocolError("invalid job control command")
+        processed_ids.add(control_id)
+        now = time.time()
+        state.update({"lastEventAt": now, "updatedAt": now})
+        atomic_write_json(Path(path) / "status.json", state)
+
+
+def run_zcode_job(configuration):
+    job_dir = configuration.get("job_dir")
+    workspace = configuration.get("workspace")
+    zcode_bin = configuration.get("zcode_bin")
+    zcode_cjs = configuration.get("zcode_cjs")
+    sandbox = configuration.get("sandbox")
+    approval_policy = configuration.get("approval_policy")
+    capability_key_path = configuration.get("capability_key_path", "")
+    capability_workspace = configuration.get("capability_workspace", "")
+    job_max_seconds = configuration.get("job_max_seconds", JOB_MAX_SECONDS_DEFAULT)
+
+    path = Path(job_dir)
+    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+        return EXIT_CONFIG
+    request = read_json_object(path / "request.json")
+    job_id = request.get("jobId")
+    internal_job_id = request.get("internalJobId")
+    if path.name != internal_job_id:
+        return EXIT_CONFIG
+    capabilities = CapabilityCodec(
+        capability_key_path,
+        capability_context(capability_workspace, sandbox, approval_policy),
+    )
+    if capabilities.decode("job", job_id) != internal_job_id:
+        return EXIT_CONFIG
+    prompt = request.get("prompt")
+    requested_thread = request.get("threadId")
+    requested_internal_thread = request.get("internalThreadId")
+    request_workspace = request.get("workspace", workspace)
+    bootstrap_required = request.get("bootstrapRequired", False)
+    existing_workspace = request.get("existingWorkspace", False)
+    project_name = request.get("projectName", "")
+    project_id = request.get("projectId", "")
+    if not isinstance(prompt, str) or not prompt:
+        return EXIT_CONFIG
+    if not isinstance(requested_thread, str) or not isinstance(
+        requested_internal_thread, str
+    ):
+        return EXIT_CONFIG
+    if requested_thread:
+        if capabilities.decode("thread", requested_thread) != requested_internal_thread:
+            return EXIT_CONFIG
+    elif requested_internal_thread:
+        return EXIT_CONFIG
+    if (
+        request_workspace != workspace
+        or not isinstance(bootstrap_required, bool)
+        or not isinstance(existing_workspace, bool)
+        or not isinstance(project_name, str)
+        or not isinstance(project_id, str)
+        or (existing_workspace and (bootstrap_required or bool(requested_thread)))
+    ):
+        return EXIT_CONFIG
+
+    state = read_json_object(path / "status.json")
+    if state.get("status") != "queued":
+        return 0 if state.get("status") == "interrupted" else EXIT_PROTOCOL
+    now = time.time()
+    state.update({
+        "status": "running",
+        "pid": os.getpid(),
+        "content": "ZCode 正在本机后台工作。",
+        "phase": "starting",
+        "activity": "正在启动 ZCode App Server。",
+        "lastEventAt": now,
+        "failureStage": "",
+        "nextAction": "wait",
+        "writerActive": False,
+        "threadHandoff": "pending",
+        "report": state.get("report") if isinstance(state.get("report"), dict) else initial_job_report(),
+        "updatedAt": now,
+    })
+    atomic_write_json(path / "status.json", state)
+
+    if (sandbox, approval_policy) != ("danger-full-access", "never"):
+        failure_content = "当前异步工作器只支持 personal-full-control 预设。"
+        state.update({
+            "status": "failed",
+            "content": failure_content,
+            "phase": "failed",
+            "activity": failure_content,
+            "failureStage": "starting",
+            "nextAction": "repair",
+            "updatedAt": time.time(),
+        })
+        finish_job_report(state, "failed", failure_content, "repair")
+        atomic_write_json(path / "status.json", state)
+        return EXIT_CONFIG
+
+    session_id = requested_internal_thread
+    public_thread_id = requested_thread
+    content = ""
+    failure_detail = ""
+    terminal_status = ""
+    expected_turn_id = ""
+    cancel_requested = {"value": False}
+    client = None
+    current_stage = "starting"
+
+    def record_event(message):
+        nonlocal content, failure_detail, terminal_status, current_stage
+        nonlocal expected_turn_id
+        method = message.get("method")
+        if not isinstance(method, str):
+            method = "event"
+        params = message.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        event_type = params.get("type") if isinstance(params.get("type"), str) else ""
+        payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+        root_event = (
+            bool(expected_turn_id) and params.get("turnId") == expected_turn_id
+        )
+        recorded_method = event_type or method
+        if method == "session/event":
+            if event_type == "turn.started":
+                if not expected_turn_id and isinstance(params.get("turnId"), str):
+                    expected_turn_id = params["turnId"]
+                    state["internalTurnId"] = expected_turn_id
+                    root_event = True
+                state["activity"] = "ZCode 正在执行任务。"
+            elif event_type == "model.streaming" and (
+                root_event or not expected_turn_id
+            ):
+                if payload.get("kind") == "text_delta":
+                    state["activity"] = "ZCode 正在输出。"
+            elif event_type == "turn.steerQueued" and (
+                root_event or not expected_turn_id
+            ):
+                state["activity"] = "已向正在运行的 ZCode 回合插入补充指令。"
+            elif event_type == "message.upserted" and (
+                root_event or not expected_turn_id
+            ):
+                role, texts, patch_files = zcode_message_text_parts(payload)
+                if role in ("assistant", "agent", ""):
+                    for text in texts:
+                        if text.strip():
+                            append_transcript(
+                                state, "zcode", "message", text, delivery="observed"
+                            )
+                        content = text or content
+                    for file_path in patch_files:
+                        append_unique_bounded(state, "changedFiles", file_path)
+            elif event_type in ("turn.completed", "turn.failed") and (
+                root_event or not expected_turn_id
+            ):
+                current_stage = "finalizing"
+                if event_type == "turn.completed":
+                    terminal_status = "completed"
+                    response = payload.get("response")
+                    if isinstance(response, str) and response:
+                        content = response
+                else:
+                    terminal_status = "failed"
+                    error = payload.get("error")
+                    if isinstance(error, dict) and isinstance(error.get("message"), str):
+                        failure_detail = error["message"]
+        elif method == "state.updated":
+            patch = params.get("patch")
+            if isinstance(patch, dict) and patch.get("status") == "running":
+                if not state.get("activity"):
+                    state["activity"] = "ZCode 正在执行任务。"
+            recorded_method = "state/" + str(params.get("reason", "updated"))
+        event_at = time.time()
+        state.update({
+            "threadId": public_thread_id,
+            "internalThreadId": session_id,
+            "lastEvent": recorded_method,
+            "lastEventAt": event_at,
+            "updatedAt": event_at,
+        })
+        atomic_write_json(path / "status.json", state)
+
+    try:
+        if bootstrap_required:
+            current_stage = "project"
+            stage_time = time.time()
+            state.update({
+                "phase": "project",
+                "activity": "正在准备 ZCode 项目工作区。",
+                "lastEventAt": stage_time,
+                "updatedAt": stage_time,
+            })
+            atomic_write_json(path / "status.json", state)
+            skill_path = resolve_workspace_new_project_skill(
+                workspace_new_project_skill
+            )
+            if not skill_path:
+                failure_content = "未找到已安装的 workspace-new-project Skill；未启动 ZCode。"
+                state.update({
+                    "status": "failed",
+                    "content": failure_content,
+                    "phase": "failed",
+                    "activity": failure_content,
+                    "failureStage": current_stage,
+                    "nextAction": "repair",
+                    "updatedAt": time.time(),
+                })
+                finish_job_report(state, "failed", failure_content, "repair")
+                atomic_write_json(path / "status.json", state)
+                return EXIT_CONFIG
+            state.update({
+                "lastEvent": "project/skill-resolved",
+                "updatedAt": time.time(),
+            })
+            atomic_write_json(path / "status.json", state)
+
+        current_stage = "app-server"
+        stage_time = time.time()
+        state.update({
+            "phase": "starting",
+            "activity": "正在连接 ZCode App Server。",
+            "lastEventAt": stage_time,
+            "updatedAt": stage_time,
+        })
+        atomic_write_json(path / "status.json", state)
+        client = ZcodeAppServerClient(
+            zcode_bin,
+            zcode_cjs,
+            workspace,
+            record_event,
+            time.monotonic() + job_max_seconds,
+        )
+
+        current_stage = "session"
+        stage_time = time.time()
+        state.update({
+            "phase": "thread",
+            "activity": (
+                "正在恢复原 ZCode 会话。"
+                if requested_internal_thread
+                else "正在创建 ZCode 会话。"
+            ),
+            "lastEventAt": stage_time,
+            "updatedAt": stage_time,
+        })
+        atomic_write_json(path / "status.json", state)
+        create_params = {
+            "workspace": {"workspaceKey": workspace, "workspacePath": workspace},
+            "mode": "yolo",
+        }
+        if requested_internal_thread:
+            create_params["sessionId"] = requested_internal_thread
+        create_result = client.request(1, "session/create", create_params)
+        session = create_result.get("session")
+        raw_session_id = (
+            session.get("sessionId") if isinstance(session, dict) else None
+        )
+        if not isinstance(raw_session_id, str) or not raw_session_id:
+            raise GuardProtocolError("invalid ZCode App Server session")
+        if requested_internal_thread and raw_session_id != requested_internal_thread:
+            raise GuardProtocolError("ZCode resumed the wrong session")
+        session_id = raw_session_id
+        public_thread_id = capabilities.encode("thread", session_id)
+        client.request(2, "session/setMode", {"sessionId": session_id, "mode": "yolo"})
+        state.update({
+            "threadId": public_thread_id,
+            "internalThreadId": session_id,
+            "lastEvent": (
+                "session/resumed" if requested_internal_thread else "session/created"
+            ),
+            "phase": "thread",
+            "activity": "ZCode 会话已就绪，准备开始执行。",
+            "writerActive": True,
+            "threadHandoff": "bridge-owned",
+            "lastEventAt": time.time(),
+            "updatedAt": time.time(),
+        })
+        atomic_write_json(path / "status.json", state)
+
+        current_stage = "turn"
+        stage_time = time.time()
+        state.update({
+            "phase": "executing",
+            "activity": "ZCode 正在执行任务。",
+            "lastEventAt": stage_time,
+            "updatedAt": stage_time,
+        })
+        atomic_write_json(path / "status.json", state)
+        client.request(3, "session/send", {
+            "sessionId": session_id,
+            "content": prompt,
+            "inputId": "bridge-initial-" + str(internal_job_id),
+        })
+        state["writerActive"] = True
+        state["threadHandoff"] = "bridge-owned"
+        state["updatedAt"] = time.time()
+        atomic_write_json(path / "status.json", state)
+        processed_control_ids = set()
+        while not terminal_status:
+            process_zcode_worker_controls(
+                client, path, state, session_id, processed_control_ids,
+                cancel_requested,
+            )
+            message = client.read(timeout_seconds=JOB_CONTROL_POLL_SECONDS)
+            if message is None:
+                continue
+            if "id" in message and "method" not in message:
+                continue
+            record_event(message)
+
+        current_stage = "finalizing"
+        stage_time = time.time()
+        state.update({
+            "phase": "finalizing",
+            "activity": "正在核对 ZCode 结果。",
+            "lastEventAt": stage_time,
+            "updatedAt": stage_time,
+        })
+        atomic_write_json(path / "status.json", state)
+
+        if len(content) > STORED_RESULT_LIMIT:
+            content = content[:STORED_RESULT_LIMIT]
+            content_truncated = True
+        else:
+            content_truncated = False
+        missing_scaffold = (
+            missing_project_scaffold(workspace) if bootstrap_required else []
+        )
+        if terminal_status == "completed":
+            if missing_scaffold:
+                failure_content = (
+                    "workspace-new-project 初始化未完成；缺少："
+                    + ", ".join(missing_scaffold)
+                )
+                state.update({
+                    "status": "failed",
+                    "threadId": public_thread_id,
+                    "internalThreadId": session_id,
+                    "content": failure_content,
+                    "contentTruncated": content_truncated,
+                    "phase": "failed",
+                    "activity": failure_content,
+                    "lastEventAt": time.time(),
+                    "failureStage": current_stage,
+                    "nextAction": "repair",
+                    "updatedAt": time.time(),
+                    "exitCode": EXIT_PROTOCOL,
+                })
+                finish_job_report(state, "failed", failure_content, "repair")
+            elif not content:
+                failure_content = "ZCode 后台任务失败：回合完成但没有返回内容。"
+                state.update({
+                    "status": "failed",
+                    "threadId": public_thread_id,
+                    "internalThreadId": session_id,
+                    "content": failure_content,
+                    "contentTruncated": content_truncated,
+                    "phase": "failed",
+                    "activity": failure_content,
+                    "lastEventAt": time.time(),
+                    "failureStage": current_stage,
+                    "nextAction": "repair",
+                    "updatedAt": time.time(),
+                    "exitCode": EXIT_PROTOCOL,
+                })
+                finish_job_report(state, "failed", failure_content, "repair")
+            else:
+                state.update({
+                    "status": "completed",
+                    "threadId": public_thread_id,
+                    "internalThreadId": session_id,
+                    "content": content,
+                    "contentTruncated": content_truncated,
+                    "phase": "completed",
+                    "activity": "ZCode 已完成，等待 ChatGPT 审查。",
+                    "lastEventAt": time.time(),
+                    "failureStage": "",
+                    "nextAction": "review",
+                    "updatedAt": time.time(),
+                    "exitCode": 0,
+                })
+                finish_job_report(state, "completed", content, "review")
+        elif cancel_requested["value"]:
+            interruption = content or failure_detail or "ZCode 后台任务已中断。"
+            state.update({
+                "status": "interrupted",
+                "threadId": public_thread_id,
+                "internalThreadId": session_id,
+                "content": interruption,
+                "contentTruncated": content_truncated,
+                "phase": "interrupted",
+                "activity": interruption,
+                "lastEventAt": time.time(),
+                "failureStage": "",
+                "nextAction": "continue" if public_thread_id else "none",
+                "updatedAt": time.time(),
+                "exitCode": 0,
+            })
+            finish_job_report(state, "interrupted", interruption, state["nextAction"])
+        else:
+            failure_content = (
+                content or failure_detail or "ZCode 后台任务失败。"
+            )
+            state.update({
+                "status": "failed",
+                "threadId": public_thread_id,
+                "internalThreadId": session_id,
+                "content": failure_content,
+                "contentTruncated": content_truncated,
+                "phase": "failed",
+                "activity": failure_content,
+                "lastEventAt": time.time(),
+                "failureStage": current_stage,
+                "nextAction": "repair",
+                "updatedAt": time.time(),
+                "exitCode": EXIT_PROTOCOL,
+            })
+            finish_job_report(state, "failed", failure_content, "repair")
+    except JobDeadlineExceeded:
+        failure_content = "ZCode background job exceeded its time limit."
+        state.update({
+            "status": "failed",
+            "threadId": public_thread_id,
+            "internalThreadId": session_id,
+            "content": failure_content,
+            "contentTruncated": False,
+            "phase": "failed",
+            "activity": failure_content,
+            "lastEventAt": time.time(),
+            "failureStage": current_stage,
+            "nextAction": "repair",
+            "updatedAt": time.time(),
+        })
+        finish_job_report(state, "failed", failure_content, "repair")
+    except (OSError, GuardProtocolError) as error:
+        diagnostic = f"{type(error).__name__}: {error}"
+        failure_content = "ZCode 后台任务中断：" + diagnostic[:1000]
+        failure_stage = current_stage
+        if "model_config_missing" in diagnostic:
+            failure_stage = "zcode_model_config"
+            failure_content = (
+                "ZCode 模型配置缺失：请先在本机完成 ZCode CLI 登录/模型配置"
+                "（~/.zcode/cli/config.json），再重试。"
+            )
+        state.update({
+            "status": "failed",
+            "threadId": public_thread_id,
+            "internalThreadId": session_id,
+            "content": failure_content,
+            "contentTruncated": False,
+            "diagnostic": diagnostic[:1000],
+            "phase": "failed",
+            "activity": failure_content,
+            "lastEventAt": time.time(),
+            "failureStage": failure_stage,
+            "nextAction": "repair",
+            "updatedAt": time.time(),
+        })
+        finish_job_report(state, "failed", failure_content, "repair")
+    finally:
+        if client is not None:
+            client.close()
+        state["writerActive"] = False
+        state["threadHandoff"] = "available" if public_thread_id else "unavailable"
+        state.pop("internalTurnId", None)
+        state["updatedAt"] = time.time()
+    atomic_write_json(path / "status.json", state)
+    return 0 if state["status"] == "completed" else EXIT_PROTOCOL
+
+
 class CodexMcpGuard:
     def __init__(
         self,
@@ -3847,14 +4803,20 @@ class CodexMcpGuard:
         max_retained_jobs=JOB_MAX_RETAINED_DEFAULT,
         job_max_seconds=JOB_MAX_SECONDS_DEFAULT,
         sync_max_seconds=SYNC_MAX_SECONDS_DEFAULT,
+        provider="codex",
+        zcode_bin=None,
+        zcode_cjs=None,
     ):
+        self.provider = provider
         self.workspace = workspace
         self.codex_bin = codex_bin
+        self.zcode_bin = zcode_bin
+        self.zcode_cjs = zcode_cjs
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.job_wait_seconds = job_wait_seconds
         self.sync_max_seconds = sync_max_seconds
-        self.public_tools = build_public_tools(sandbox, approval_policy)
+        self.public_tools = build_public_tools(sandbox, approval_policy, prefix=provider)
         if job_state_dir is None:
             if os.name == "nt":
                 state_home = Path(
@@ -3880,13 +4842,25 @@ class CodexMcpGuard:
             max_active_jobs,
             max_retained_jobs,
             job_max_seconds,
+            provider=provider,
+            zcode_bin=zcode_bin,
+            zcode_cjs=zcode_cjs,
         )
-        self.catalog = CodexCatalog(
-            workspace,
-            codex_bin,
-            self.job_store.capabilities,
-            self.job_store,
-        )
+        if provider == "zcode":
+            self.catalog = ZcodeCatalog(
+                workspace,
+                zcode_bin,
+                zcode_cjs,
+                self.job_store.capabilities,
+                self.job_store,
+            )
+        else:
+            self.catalog = CodexCatalog(
+                workspace,
+                codex_bin,
+                self.job_store.capabilities,
+                self.job_store,
+            )
         self.child = None
         self.initialize_result = None
         self.initialize_in_flight = False
@@ -4805,12 +5779,372 @@ class CodexMcpGuard:
             selector.close()
 
 
+class ZcodeMcpGuard(CodexMcpGuard):
+    """Daemon variant for provider="zcode": no downstream MCP child, tools are
+    answered locally, sync tools run as short-lived ZCode sessions."""
+
+    def __init__(
+        self,
+        workspace,
+        zcode_bin,
+        zcode_cjs,
+        sandbox="danger-full-access",
+        approval_policy="never",
+        job_state_dir=None,
+        job_wait_seconds=JOB_WAIT_DEFAULT_SECONDS,
+        workspace_new_project_skill="",
+        max_active_jobs=JOB_MAX_ACTIVE_DEFAULT,
+        max_retained_jobs=JOB_MAX_RETAINED_DEFAULT,
+        job_max_seconds=JOB_MAX_SECONDS_DEFAULT,
+        sync_max_seconds=SYNC_MAX_SECONDS_DEFAULT,
+    ):
+        super().__init__(
+            workspace,
+            None,
+            sandbox,
+            approval_policy,
+            job_state_dir=job_state_dir,
+            job_wait_seconds=job_wait_seconds,
+            workspace_new_project_skill=workspace_new_project_skill,
+            max_active_jobs=max_active_jobs,
+            max_retained_jobs=max_retained_jobs,
+            job_max_seconds=job_max_seconds,
+            sync_max_seconds=sync_max_seconds,
+            provider="zcode",
+            zcode_bin=zcode_bin,
+            zcode_cjs=zcode_cjs,
+        )
+
+    def start_child(self):
+        return
+
+    def stop_child(self):
+        return
+
+    def emit_resources_list(self, request_id):
+        self.emit({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "resources": [{
+                    "uri": WIDGET_URI,
+                    "name": "zcode-job-status",
+                    "title": "ZCode background job status",
+                    "description": (
+                        "Polls a durable local ZCode job and offers one-click "
+                        "result return to this conversation."
+                    ),
+                    "mimeType": "text/html;profile=mcp-app",
+                }]
+            },
+        })
+
+    def _zcode_sync_call(self, request_id, prompt, internal_thread_id=None):
+        deadline = time.monotonic() + self.sync_max_seconds
+        client = None
+        try:
+            client = ZcodeAppServerClient(
+                self.zcode_bin,
+                self.zcode_cjs,
+                self.workspace,
+                lambda _message: None,
+                deadline,
+            )
+            create_params = {
+                "workspace": {
+                    "workspaceKey": self.workspace,
+                    "workspacePath": self.workspace,
+                },
+            }
+            if internal_thread_id:
+                create_params["sessionId"] = internal_thread_id
+            created = client.request(1, "session/create", create_params)
+            session = created.get("session")
+            session_id = (
+                session.get("sessionId") if isinstance(session, dict) else None
+            )
+            if not isinstance(session_id, str) or not session_id:
+                raise GuardProtocolError("invalid ZCode App Server session")
+            if internal_thread_id and session_id != internal_thread_id:
+                raise GuardProtocolError("ZCode resumed the wrong session")
+            mode = (
+                "yolo"
+                if (self.sandbox, self.approval_policy) == ("danger-full-access", "never")
+                else "build"
+            )
+            client.request(2, "session/setMode", {"sessionId": session_id, "mode": mode})
+            content = ""
+            terminal = ""
+
+            def on_event(message):
+                nonlocal content, terminal
+                params = message.get("params")
+                if not isinstance(params, dict):
+                    return
+                payload = (
+                    params.get("payload")
+                    if isinstance(params.get("payload"), dict)
+                    else {}
+                )
+                event_type = params.get("type")
+                if event_type == "message.upserted":
+                    _role, texts, _files = zcode_message_text_parts(payload)
+                    for text in texts:
+                        if text.strip():
+                            content = text
+                elif event_type == "turn.completed":
+                    terminal = "completed"
+                    response = payload.get("response")
+                    if isinstance(response, str) and response:
+                        content = response
+                elif event_type == "turn.failed":
+                    terminal = "failed"
+                    error = payload.get("error")
+                    if isinstance(error, dict) and isinstance(error.get("message"), str):
+                        content = content or error["message"]
+
+            client.event_handler = on_event
+            client.request(3, "session/send", {
+                "sessionId": session_id,
+                "content": prompt,
+            })
+            while not terminal:
+                message = client.read()
+                if message is None:
+                    continue
+                on_event(message)
+            thread_id = self.job_store.capabilities.encode("thread", session_id)
+            self.emit({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": content}],
+                    "structuredContent": {
+                        "threadId": thread_id,
+                        "content": content,
+                    },
+                },
+            })
+        except JobDeadlineExceeded:
+            self.emit(jsonrpc_error(request_id, -32000, "ZCode sync deadline exceeded"))
+        except (OSError, GuardProtocolError) as error:
+            self.emit(jsonrpc_error(
+                request_id,
+                -32000,
+                "ZCode sync call failed: " + str(error)[:300],
+            ))
+        finally:
+            if client is not None:
+                client.close()
+
+    def handle_client_message(self, message):
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+            raise GuardProtocolError("invalid client JSON-RPC")
+        method = message.get("method")
+        if method is None:
+            raise GuardProtocolError("invalid client JSON-RPC response")
+        if not isinstance(method, str):
+            raise GuardProtocolError("invalid client JSON-RPC method")
+
+        if method == "initialize":
+            request_id = message.get("id")
+            if request_id is None:
+                raise GuardProtocolError("initialize requires an id")
+            params = message.get("params")
+            requested_version = (
+                params.get("protocolVersion")
+                if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str)
+                else ""
+            )
+            self.tool_list_verified = True
+            self.initialize_result = {
+                "protocolVersion": requested_version or "2025-06-18",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"listChanged": False},
+                },
+                "serverInfo": {
+                    "name": "zcode_mcp_guard",
+                    "title": "ZCode MCP Guard",
+                    "version": APP_SERVER_CLIENT_VERSION,
+                },
+            }
+            self.emit({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": self.initialize_result,
+            })
+            return
+
+        if method == "notifications/initialized":
+            return
+
+        if method == "tools/list":
+            request_id = message.get("id")
+            if request_id is None:
+                raise GuardProtocolError("tools/list requires an id")
+            self.tool_list_verified = True
+            self.emit({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"tools": self.public_tools},
+            })
+            return
+
+        if method in ("resources/list", "resources/read"):
+            request_id = message.get("id")
+            if request_id is None:
+                raise GuardProtocolError(method + " requires an id")
+            if method == "resources/list":
+                self.emit_resources_list(request_id)
+            else:
+                self.emit_resource(request_id, message.get("params"))
+            return
+
+        if method == "tools/call":
+            request_id = message.get("id")
+            if request_id is None:
+                raise GuardProtocolError("tools/call requires an id")
+            params = validate_tool_call_params(message.get("params"))
+            if params is None:
+                self.invalid_params(request_id)
+                return
+            name = params["name"]
+            if not isinstance(name, str) or not name.startswith("zcode"):
+                self.emit(jsonrpc_error(request_id, -32601, "Unknown tool"))
+                return
+            canonical = "codex" + name[len("zcode"):]
+            full_control = (self.sandbox, self.approval_policy) == (
+                "danger-full-access",
+                "never",
+            )
+            if canonical == "codex":
+                if os.name == "nt" and full_control:
+                    async_params = dict(params)
+                    async_params["name"] = "codex-run"
+                    self.handle_async_call(message, async_params)
+                else:
+                    arguments = params.get("arguments")
+                    prompt = (
+                        arguments.get("prompt")
+                        if isinstance(arguments, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(prompt, str)
+                        or len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES
+                    ):
+                        self.invalid_params(request_id)
+                        return
+                    self._zcode_sync_call(request_id, prompt)
+            elif canonical == "codex-reply":
+                if os.name == "nt" and full_control:
+                    async_params = dict(params)
+                    async_params["name"] = "codex-reply-async"
+                    self.handle_async_call(message, async_params)
+                else:
+                    arguments = params.get("arguments")
+                    prompt = (
+                        arguments.get("prompt")
+                        if isinstance(arguments, dict)
+                        else None
+                    )
+                    thread_id = (
+                        arguments.get("threadId")
+                        if isinstance(arguments, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(prompt, str)
+                        or len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES
+                        or not isinstance(thread_id, str)
+                        or not thread_id
+                    ):
+                        self.invalid_params(request_id)
+                        return
+                    try:
+                        internal_thread_id = self.job_store.capabilities.decode(
+                            "thread", thread_id
+                        )
+                    except GuardProtocolError:
+                        self.invalid_params(request_id, "Unknown or invalid threadId")
+                        return
+                    self._zcode_sync_call(request_id, prompt, internal_thread_id)
+            elif canonical in (
+                "codex-run",
+                "codex-start",
+                "codex-reply-async",
+                "codex-wait",
+                "codex-job-open",
+                "codex-job-status",
+                "codex-job-steer",
+                "codex-job-cancel",
+            ):
+                self.handle_async_call(message, params)
+            elif canonical in (
+                "codex-overview",
+                "codex-project-list",
+                "codex-repository-list",
+                "codex-thread-list",
+                "codex-thread-read",
+                "codex-job-list",
+            ):
+                self.handle_catalog_call(message, params)
+            else:
+                self.emit(jsonrpc_error(request_id, -32601, "Unknown tool"))
+            return
+
+        if "id" in message:
+            self.emit(jsonrpc_error(message["id"], -32601, "Method not found: " + method))
+
+    def run(self):
+        if os.name == "nt":
+            reader = PipeChunkReader({"client": sys.stdin.buffer})
+            while True:
+                self.expire_sync_requests()
+                event = reader.get(timeout=0.25)
+                if event is None:
+                    continue
+                _source, chunk, read_error = event
+                if read_error is not None:
+                    raise GuardProtocolError("stdio read failed") from read_error
+                if not chunk:
+                    return 0
+                self.consume("client", chunk)
+        selector = selectors.DefaultSelector()
+        selector.register(sys.stdin.buffer, selectors.EVENT_READ, "client")
+        try:
+            while True:
+                self.expire_sync_requests()
+                events = selector.select(timeout=0.25)
+                if not events:
+                    self.expire_sync_requests()
+                    continue
+                for key, _ in events:
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                    except OSError as error:
+                        raise GuardProtocolError("stdio read failed") from error
+                    if not chunk:
+                        return 0
+                    self.consume("client", chunk)
+        finally:
+            selector.close()
+
+
 def parse_configuration(argv):
     parser = argparse.ArgumentParser(
-        description="Policy-fixed bridge for the official Codex MCP server"
+        description="Policy-fixed bridge for the configured execution backend"
     )
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--codex-bin", required=True)
+    parser.add_argument(
+        "--provider",
+        choices=("codex", "zcode"),
+        default="codex",
+    )
+    parser.add_argument("--codex-bin", default=None)
+    parser.add_argument("--zcode-bin", default=None)
+    parser.add_argument("--zcode-cjs", default=None)
     parser.add_argument(
         "--desktop-open-bin",
         default=DEFAULT_DESKTOP_OPEN_BIN,
@@ -4864,14 +6198,31 @@ def parse_configuration(argv):
     )
     arguments = parser.parse_args(argv)
     workspace = require_real_absolute_path(arguments.workspace, want_directory=True)
-    codex_bin = require_real_absolute_path(
-        arguments.codex_bin, want_directory=False, want_executable=True
-    )
-    desktop_open_bin = require_real_absolute_path(
-        arguments.desktop_open_bin,
-        want_directory=False,
-        want_executable=True,
-    )
+    provider = arguments.provider
+    codex_bin = None
+    zcode_bin = None
+    zcode_cjs = None
+    if provider == "zcode":
+        if not arguments.zcode_bin or not arguments.zcode_cjs:
+            raise GuardConfigurationError()
+        zcode_bin = require_real_absolute_path(
+            arguments.zcode_bin, want_directory=False, want_executable=True
+        )
+        zcode_cjs = require_real_absolute_path(
+            arguments.zcode_cjs, want_directory=False
+        )
+        desktop_open_bin = DEFAULT_DESKTOP_OPEN_BIN
+    else:
+        if not arguments.codex_bin:
+            raise GuardConfigurationError()
+        codex_bin = require_real_absolute_path(
+            arguments.codex_bin, want_directory=False, want_executable=True
+        )
+        desktop_open_bin = require_real_absolute_path(
+            arguments.desktop_open_bin,
+            want_directory=False,
+            want_executable=True,
+        )
     if (arguments.sandbox, arguments.approval_policy) not in SUPPORTED_POLICIES:
         raise GuardConfigurationError()
     if (
@@ -4903,30 +6254,40 @@ def parse_configuration(argv):
             workspace_new_project_skill,
             want_directory=False,
         )
-    return (
-        workspace,
-        codex_bin,
-        desktop_open_bin,
-        arguments.sandbox,
-        arguments.approval_policy,
-        job_state_dir,
-        arguments.job_wait_seconds,
-        workspace_new_project_skill,
-        arguments.max_active_jobs,
-        arguments.max_retained_jobs,
-        arguments.job_max_seconds,
-        arguments.sync_max_seconds,
-    )
+    return {
+        "workspace": workspace,
+        "provider": provider,
+        "codex_bin": codex_bin,
+        "zcode_bin": zcode_bin,
+        "zcode_cjs": zcode_cjs,
+        "desktop_open_bin": desktop_open_bin,
+        "sandbox": arguments.sandbox,
+        "approval_policy": arguments.approval_policy,
+        "job_state_dir": job_state_dir,
+        "job_wait_seconds": arguments.job_wait_seconds,
+        "workspace_new_project_skill": workspace_new_project_skill,
+        "max_active_jobs": arguments.max_active_jobs,
+        "max_retained_jobs": arguments.max_retained_jobs,
+        "job_max_seconds": arguments.job_max_seconds,
+        "sync_max_seconds": arguments.sync_max_seconds,
+    }
 
 
 def parse_worker_configuration(argv):
     parser = argparse.ArgumentParser(
-        description="Run one durable Codex background job"
+        description="Run one durable bridge background job"
     )
     parser.add_argument("--run-job", required=True)
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--codex-bin", required=True)
-    parser.add_argument("--desktop-open-bin", required=True)
+    parser.add_argument(
+        "--provider",
+        choices=("codex", "zcode"),
+        default="codex",
+    )
+    parser.add_argument("--codex-bin", default=None)
+    parser.add_argument("--desktop-open-bin", default=None)
+    parser.add_argument("--zcode-bin", default=None)
+    parser.add_argument("--zcode-cjs", default=None)
     parser.add_argument("--workspace-new-project-skill", default="")
     parser.add_argument("--capability-key-path", required=True)
     parser.add_argument("--capability-workspace", required=True)
@@ -4944,14 +6305,31 @@ def parse_worker_configuration(argv):
     arguments = parser.parse_args(argv)
     job_dir = require_real_absolute_path(arguments.run_job, want_directory=True)
     workspace = require_real_absolute_path(arguments.workspace, want_directory=True)
-    codex_bin = require_real_absolute_path(
-        arguments.codex_bin, want_directory=False, want_executable=True
-    )
-    desktop_open_bin = require_real_absolute_path(
-        arguments.desktop_open_bin,
-        want_directory=False,
-        want_executable=True,
-    )
+    provider = arguments.provider
+    codex_bin = None
+    zcode_bin = None
+    zcode_cjs = None
+    desktop_open_bin = None
+    if provider == "zcode":
+        if not arguments.zcode_bin or not arguments.zcode_cjs:
+            raise GuardConfigurationError()
+        zcode_bin = require_real_absolute_path(
+            arguments.zcode_bin, want_directory=False, want_executable=True
+        )
+        zcode_cjs = require_real_absolute_path(
+            arguments.zcode_cjs, want_directory=False
+        )
+    else:
+        if not arguments.codex_bin or not arguments.desktop_open_bin:
+            raise GuardConfigurationError()
+        codex_bin = require_real_absolute_path(
+            arguments.codex_bin, want_directory=False, want_executable=True
+        )
+        desktop_open_bin = require_real_absolute_path(
+            arguments.desktop_open_bin,
+            want_directory=False,
+            want_executable=True,
+        )
     if (arguments.sandbox, arguments.approval_policy) not in SUPPORTED_POLICIES:
         raise GuardConfigurationError()
     capability_key_path = require_real_absolute_path(
@@ -4974,18 +6352,21 @@ def parse_worker_configuration(argv):
             workspace_new_project_skill,
             want_directory=False,
         )
-    return (
-        job_dir,
-        workspace,
-        codex_bin,
-        arguments.sandbox,
-        arguments.approval_policy,
-        desktop_open_bin,
-        workspace_new_project_skill,
-        capability_key_path,
-        capability_workspace,
-        arguments.job_max_seconds,
-    )
+    return {
+        "job_dir": job_dir,
+        "workspace": workspace,
+        "provider": provider,
+        "codex_bin": codex_bin,
+        "desktop_open_bin": desktop_open_bin,
+        "zcode_bin": zcode_bin,
+        "zcode_cjs": zcode_cjs,
+        "sandbox": arguments.sandbox,
+        "approval_policy": arguments.approval_policy,
+        "workspace_new_project_skill": workspace_new_project_skill,
+        "capability_key_path": capability_key_path,
+        "capability_workspace": capability_workspace,
+        "job_max_seconds": arguments.job_max_seconds,
+    }
 
 
 def main(argv=None):
@@ -5005,46 +6386,59 @@ def main(argv=None):
     if "--run-job" in effective_argv:
         try:
             configuration = parse_worker_configuration(effective_argv)
-            return run_job(*configuration)
+            if configuration["provider"] == "zcode":
+                return run_zcode_job(configuration)
+            return run_job(
+                configuration["job_dir"],
+                configuration["workspace"],
+                configuration["codex_bin"],
+                configuration["sandbox"],
+                configuration["approval_policy"],
+                configuration["desktop_open_bin"],
+                configuration["workspace_new_project_skill"],
+                configuration["capability_key_path"],
+                configuration["capability_workspace"],
+                configuration["job_max_seconds"],
+            )
         except (GuardConfigurationError, GuardProtocolError, SystemExit) as error:
             if isinstance(error, SystemExit) and error.code == 0:
                 return 0
             return EXIT_CONFIG
     try:
-        (
-            workspace,
-            codex_bin,
-            desktop_open_bin,
-            sandbox,
-            approval_policy,
-            job_state_dir,
-            job_wait_seconds,
-            workspace_new_project_skill,
-            max_active_jobs,
-            max_retained_jobs,
-            job_max_seconds,
-            sync_max_seconds,
-        ) = parse_configuration(effective_argv)
+        configuration = parse_configuration(effective_argv)
     except (GuardConfigurationError, SystemExit) as error:
         if isinstance(error, SystemExit) and error.code == 0:
             return 0
         print("codex-mcp-guard: configuration rejected", file=sys.stderr)
         return EXIT_CONFIG
 
-    guard = CodexMcpGuard(
-        workspace,
-        codex_bin,
-        sandbox,
-        approval_policy,
-        desktop_open_bin=desktop_open_bin,
-        job_state_dir=job_state_dir,
-        job_wait_seconds=job_wait_seconds,
-        workspace_new_project_skill=workspace_new_project_skill,
-        max_active_jobs=max_active_jobs,
-        max_retained_jobs=max_retained_jobs,
-        job_max_seconds=job_max_seconds,
-        sync_max_seconds=sync_max_seconds,
-    )
+    guard_arguments = {
+        "job_state_dir": configuration["job_state_dir"],
+        "job_wait_seconds": configuration["job_wait_seconds"],
+        "workspace_new_project_skill": configuration["workspace_new_project_skill"],
+        "max_active_jobs": configuration["max_active_jobs"],
+        "max_retained_jobs": configuration["max_retained_jobs"],
+        "job_max_seconds": configuration["job_max_seconds"],
+        "sync_max_seconds": configuration["sync_max_seconds"],
+    }
+    if configuration["provider"] == "zcode":
+        guard = ZcodeMcpGuard(
+            configuration["workspace"],
+            configuration["zcode_bin"],
+            configuration["zcode_cjs"],
+            sandbox=configuration["sandbox"],
+            approval_policy=configuration["approval_policy"],
+            **guard_arguments,
+        )
+    else:
+        guard = CodexMcpGuard(
+            configuration["workspace"],
+            configuration["codex_bin"],
+            configuration["sandbox"],
+            configuration["approval_policy"],
+            desktop_open_bin=configuration["desktop_open_bin"],
+            **guard_arguments,
+        )
 
     def stop_for_signal(_signum, _frame):
         raise KeyboardInterrupt()
