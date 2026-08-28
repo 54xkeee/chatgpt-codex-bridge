@@ -13,11 +13,35 @@ and task until the requested outcome is complete.
 
 ## Architecture
 
-`ChatGPT conversation → Secure MCP Tunnel → stdio Guard → Codex App Server → local project`
+`ChatGPT conversation → Secure MCP Tunnel → stdio Guard → execution backend → local project`
 
 The package reuses official `tunnel-client` for transport and authorization. It
 does not ship `.mcp.json`, because loading the Guard as a Codex-local MCP would
 create a recursive Codex-to-Guard-to-Codex path.
+
+## Execution providers
+
+The Windows installer accepts `-Provider {codex,zcode}`. One installation
+serves exactly one backend; public tool names take the backend prefix
+(`codex-*` or `zcode-*`), and presets map for real: `personal-full-control`
+runs ZCode in `yolo` mode, `workspace-safe` runs it in `build` mode with the
+bridge denying permission requests (deny-by-default; there is no interactive
+user beside the bridge).
+
+- **codex** (default): drives `codex app-server --listen stdio://` exactly as
+  before; authenticated Codex is required.
+- **zcode**: drives the ZCode desktop CLI's `app-server --stdio` protocol
+  (`ZCode.exe resources\glm\zcode.cjs` with `ELECTRON_RUN_AS_NODE=1`).
+  Install with `-Provider zcode -ZCodeBin <path to ZCode.exe>`. The ZCode CLI
+  model config (`~/.zcode/cli/config.json`) must resolve before install
+  succeeds — complete ZCode CLI login first; install fails closed otherwise.
+  Steering uses ZCode's same-turn input (`session/send` while a turn is
+  running) and cancellation uses `session/stop` before the verified worker
+  fallback.
+
+Job persistence, HMAC capability signing, the controls mailbox, transcript
+bounding, cancel fallback, process-ownership verification, and the tunnel
+lifecycle are shared by both providers.
 
 ## Quickstart
 

@@ -33,6 +33,25 @@ flowchart LR
 得到的整体内容经常比单独使用最高档 Codex 5.6 Sol 更强。这是工作流体验，
 不是受控模型评测结论。
 
+## 执行后端可切换：Codex 或 ZCode
+
+Windows 安装器支持 `-Provider {codex,zcode}`（默认 `codex`）。一次安装只服务
+一个后端；公开工具名带后端前缀（`codex-*` 或 `zcode-*`），预设做真实映射：
+`personal-full-control` = ZCode `yolo` 模式，`workspace-safe` = ZCode `build`
+模式且由 Bridge 一律拒绝权限请求（无人在侧，默认拒绝）。
+
+- **codex**：沿用原有 `codex app-server --listen stdio://` 链路，需要已登录的 Codex。
+- **zcode**：驱动 ZCode 桌面 CLI 自带的 `app-server --stdio` 协议
+  （`ZCode.exe resources\glm\zcode.cjs`，`ELECTRON_RUN_AS_NODE=1`）。
+  安装：`-Provider zcode -ZCodeBin <ZCode.exe 路径>`。安装前必须能解析
+  ZCode CLI 模型配置（`~/.zcode/cli/config.json`，先完成 ZCode CLI 登录），
+  否则 fail closed。插话使用 ZCode 原生的同回合输入（运行中 `session/send`），
+  取消先走 `session/stop`，仅在必要时才走已验证归属的 worker 兜底终止。
+
+两个后端共享同一套任务持久化、HMAC 能力签名、controls 信箱、transcript
+边界、取消兜底、进程归属校验和 Tunnel 生命周期。协议事实与验证记录见
+`docs/specs/zcode-port/` 与 ADR-0019。
+
 ## 可持久恢复的状态卡片
 
 下面三张图由当前 Guard 小部件和合成任务数据生成，路径、Job ID 与结果均为

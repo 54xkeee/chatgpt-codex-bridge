@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-codex-bridge",
-  "version": "0.6.1+codex.20260824010445",
+  "version": "0.7.0+zcode.20260828234419",
   "description": "Use ChatGPT Pro as the supervisor for local Codex on Windows or macOS through OpenAI Secure MCP Tunnel.",
   "author": {
     "name": "larryppgg and 54xkeee",
