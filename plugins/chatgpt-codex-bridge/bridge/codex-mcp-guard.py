@@ -4700,7 +4700,7 @@ def run_zcode_job(configuration):
                     "exitCode": 0,
                 })
                 finish_job_report(state, "completed", content, "review")
-        elif cancel_requested["value"]:
+        elif cancel_requested.get("cancel_requested"):
             interruption = content or failure_detail or "ZCode 后台任务已中断。"
             state.update({
                 "status": "interrupted",
@@ -6014,13 +6014,15 @@ class ZcodeMcpGuard(CodexMcpGuard):
                 self.emit(jsonrpc_error(request_id, -32601, "Unknown tool"))
                 return
             canonical = "codex" + name[len("zcode"):]
+            canonical_params = dict(params)
+            canonical_params["name"] = canonical
             full_control = (self.sandbox, self.approval_policy) == (
                 "danger-full-access",
                 "never",
             )
             if canonical == "codex":
                 if os.name == "nt" and full_control:
-                    async_params = dict(params)
+                    async_params = dict(canonical_params)
                     async_params["name"] = "codex-run"
                     self.handle_async_call(message, async_params)
                 else:
@@ -6039,7 +6041,7 @@ class ZcodeMcpGuard(CodexMcpGuard):
                     self._zcode_sync_call(request_id, prompt)
             elif canonical == "codex-reply":
                 if os.name == "nt" and full_control:
-                    async_params = dict(params)
+                    async_params = dict(canonical_params)
                     async_params["name"] = "codex-reply-async"
                     self.handle_async_call(message, async_params)
                 else:
@@ -6080,7 +6082,7 @@ class ZcodeMcpGuard(CodexMcpGuard):
                 "codex-job-steer",
                 "codex-job-cancel",
             ):
-                self.handle_async_call(message, params)
+                self.handle_async_call(message, canonical_params)
             elif canonical in (
                 "codex-overview",
                 "codex-project-list",
@@ -6089,7 +6091,7 @@ class ZcodeMcpGuard(CodexMcpGuard):
                 "codex-thread-read",
                 "codex-job-list",
             ):
-                self.handle_catalog_call(message, params)
+                self.handle_catalog_call(message, canonical_params)
             else:
                 self.emit(jsonrpc_error(request_id, -32601, "Unknown tool"))
             return
@@ -6289,8 +6291,8 @@ def parse_worker_configuration(argv):
     parser.add_argument("--zcode-bin", default=None)
     parser.add_argument("--zcode-cjs", default=None)
     parser.add_argument("--workspace-new-project-skill", default="")
-    parser.add_argument("--capability-key-path", required=True)
-    parser.add_argument("--capability-workspace", required=True)
+    parser.add_argument("--capability-key-path", default="")
+    parser.add_argument("--capability-workspace", default="")
     parser.add_argument("--job-max-seconds", type=float, required=True)
     parser.add_argument(
         "--sandbox",

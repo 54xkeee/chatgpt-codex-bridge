@@ -17,6 +17,8 @@ jobs:
           python-version: "3.12"
       - name: Run Guard contract tests
         run: python3 -m unittest tests.bridge.test-codex-mcp-guard
+      - name: Run ZCode provider contract tests
+        run: python3 -m unittest tests.bridge.test-zcode-mcp-guard
       - name: Verify packaged Guard identity
         run: cmp scripts/bridge/codex-mcp-guard.py plugins/chatgpt-codex-bridge/bridge/codex-mcp-guard.py
 

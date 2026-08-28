@@ -29,8 +29,9 @@ Order matters; keep diffs small; run guard tests after every task.
       (`session/send` / `session/stop`) with overlay semantics unchanged.
 - [ ] T6 Guard: tool-prefix parameterization → `zcode-*` surface; Windows
       sync→async redirect keyed on provider; catalog over `session/*`.
-- [ ] T7 Tests: FAKE_ZCODE + ZCode contract cases (design.md §9); keep all 60
-      codex cases green.
+- [x] T7 Tests: FAKE_ZCODE + 12 ZCode contract cases
+      (tests/bridge/test-zcode-mcp-guard.py, wired into CI) — all green;
+      60 Codex cases still green.
 - [ ] T8 Windows: `-Provider/-ZCodeBin` in controller, `run-guard-windows.ps1`
       args, doctor model-config check; extend `test_windows_port.ps1`
       (zcode fixture, Chinese path suite).
