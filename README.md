@@ -18,6 +18,10 @@ PowerShell 5.1 controller, durable Windows process handling, a global Codex
 catalog, structured progress reports, and a verified ChatGPT-to-Windows round
 trip.
 
+> Note: a ZCode execution-provider port was started and then shelved on the
+> [`zcode-port`](https://github.com/54xkeee/chatgpt-codex-bridge/tree/zcode-port)
+> branch — dormant, unmaintained, end-to-end acceptance never run. Do not use it.
+
 ## Why ChatGPT Pro in the loop?
 
 Codex is excellent at operating inside a repository. ChatGPT Pro is useful as

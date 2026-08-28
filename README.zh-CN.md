@@ -13,6 +13,10 @@ PowerShell 5.1 控制器、Windows 进程树治理、全局 Codex 目录、结�
 报告，以及已经真实跑通的 ChatGPT → Secure MCP Tunnel → Windows Codex
 → ChatGPT 链路。
 
+> 说明：ZCode 执行后端移植已停止，代码冻结在
+> [`zcode-port`](https://github.com/54xkeee/chatgpt-codex-bridge/tree/zcode-port)
+> 分支（休眠、不维护、未跑通端到端验收，请勿使用）。
+
 ## ChatGPT Pro 做主管，为什么有用？
 
 Codex 擅长进入仓库执行；ChatGPT Pro 更适合站在任务上层，持续保留目标、
