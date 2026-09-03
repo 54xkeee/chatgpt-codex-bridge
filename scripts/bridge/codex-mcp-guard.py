@@ -24,6 +24,10 @@ import unicodedata
 import uuid
 from pathlib import Path
 
+_here = Path(__file__).resolve().parent
+if str(_here) not in sys.path:
+    sys.path.insert(0, str(_here))
+
 if os.name == "nt":
     import ctypes
     import msvcrt
@@ -915,6 +919,11 @@ def build_public_tools(sandbox, approval_policy):
             "annotations": READ_ONLY_ANNOTATIONS,
         },
     ])
+    try:
+        from controller.tools import get_generic_tools_schema
+        tools.extend(get_generic_tools_schema())
+    except Exception:
+        pass
     return tools
 
 
@@ -936,6 +945,8 @@ class JobDeadlineExceeded(GuardProtocolError):
 
 class CapabilityCodec:
     AUDIENCES = frozenset({
+        "session",
+        "session-request",
         "job",
         "thread",
         "project",
@@ -4230,6 +4241,54 @@ class CodexMcpGuard:
         self.pending_child_requests = set()
         self.buffers = {"client": bytearray(), "child": bytearray()}
 
+        # Initialize Generic Controller Subsystems
+        try:
+            from controller.session import SessionStore
+            from controller.workspace_lock import WorkspaceLockManager
+            from controller.approval_server import ApprovalServer
+            from controller.codex_gate import CodexSessionGate
+            from controller.tools import GenericToolsDispatcher
+            from controller.adapters.mock_adapter import MockExecutorAdapter
+            from controller.adapters.codex_adapter import CodexExecutorAdapter
+            from controller.adapters.pi_adapter import PiExecutorAdapter
+            from controller.adapters.antigravity_adapter import AntigravityExecutorAdapter
+
+            controller_state_dir = Path(job_state_dir).parent if job_state_dir else Path.home() / ".chatgpt-codex-bridge"
+            self.session_store = SessionStore(controller_state_dir)
+            self.workspace_lock_mgr = WorkspaceLockManager()
+            self.adapters = {
+                "mock": MockExecutorAdapter(),
+                "codex": CodexExecutorAdapter(codex_bin=codex_bin, job_state_dir=job_state_dir),
+                "pi": PiExecutorAdapter(),
+                "antigravity": AntigravityExecutorAdapter(),
+            }
+            self.approval_server = ApprovalServer(
+                session_store=self.session_store,
+                workspace_lock_mgr=self.workspace_lock_mgr,
+                adapter_registry=self.adapters,
+            )
+            self.approval_server.start()
+            self.generic_dispatcher = GenericToolsDispatcher(
+                session_store=self.session_store,
+                workspace_lock_mgr=self.workspace_lock_mgr,
+                capability_codec=self.job_store.capabilities,
+                adapters=self.adapters,
+                approval_server=self.approval_server,
+            )
+            self.codex_session_gate = CodexSessionGate(
+                session_store=self.session_store,
+                capability_codec=self.job_store.capabilities,
+                approval_server=self.approval_server,
+                default_workspace=workspace,
+            )
+        except Exception as err:
+            sys.stderr.write(f"codex-mcp-guard: generic controller init skipped: {err}\n")
+            self.session_store = None
+            self.workspace_lock_mgr = None
+            self.approval_server = None
+            self.generic_dispatcher = None
+            self.codex_session_gate = None
+
     def emit(self, message):
         encoded = json.dumps(
             message, ensure_ascii=False, separators=(",", ":")
@@ -4263,6 +4322,11 @@ class CodexMcpGuard:
             raise GuardConfigurationError() from error
 
     def stop_child(self):
+        if getattr(self, "approval_server", None):
+            try:
+                self.approval_server.stop()
+            except Exception:
+                pass
         if self.child is None:
             return
         try:
@@ -4857,6 +4921,50 @@ class CodexMcpGuard:
                 self.invalid_params(request_id)
                 return
             name = params["name"]
+
+            # Generic executor_* tools dispatch
+            if name.startswith("executor_") and getattr(self, "generic_dispatcher", None):
+                try:
+                    tool_result = self.generic_dispatcher.dispatch(name, params.get("arguments", {}))
+                    self.emit({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(tool_result, ensure_ascii=False, indent=2)}],
+                            "structuredContent": tool_result,
+                        },
+                    })
+                except Exception as err:
+                    self.emit({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [{"type": "text", "text": str(err)}],
+                            "isError": True,
+                        },
+                    })
+                return
+
+            # P0: Legacy Codex tools Session Gate
+            if (
+                name in ("codex", "codex-run", "codex-start", "codex-reply", "codex-reply-async")
+                and getattr(self, "codex_session_gate", None)
+            ):
+                allowed, gate_resp = self.codex_session_gate.check_or_gate(
+                    name, params.get("arguments", {}), workspace=self.workspace
+                )
+                if not allowed:
+                    self.emit({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(gate_resp, ensure_ascii=False, indent=2)}],
+                            "structuredContent": gate_resp,
+                            "isError": True,
+                        },
+                    })
+                    return
+
             if name == "codex":
                 if os.name == "nt" and (
                     self.sandbox, self.approval_policy
